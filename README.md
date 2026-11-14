@@ -43,18 +43,29 @@ _Screenshots will follow._
 - **Privacy:** no telemetry, no update checks, no network traffic except the scan itself. Scan
   results are only written to disk when you export them; only the settings are saved.
 
-## Install
+## Download
 
-1. Download `Ironsight_<version>_x64-setup.exe` from the
-   [releases page](https://github.com/MarCel06xX/ironsight/releases).
-2. Run it. It installs for the current user, so no administrator rights are needed.
+Get the files from the [releases page](https://github.com/MarCel06xX/ironsight/releases):
 
-Requirements: Windows 10 or 11 (x64) with the Microsoft Edge WebView2 runtime (part of
-Windows 11; the installer downloads it if it is missing).
+| File | Description |
+| --- | --- |
+| `Ironsight_<version>_x64-setup.exe` | **Installer.** Installs for the current user (no administrator rights) with a Start menu entry. Downloads the WebView2 runtime if it is missing. |
+| `Ironsight_<version>_x64-portable.zip` | **Portable.** Unzip anywhere and run `Ironsight.exe`. Because of the included `portable` marker file, settings and the WebView2 profile are stored in a `data` folder next to the exe instead of AppData. |
+| `SHA256SUMS.txt` | SHA-256 checksums of both files. |
 
-The installer is not code-signed yet, so Windows SmartScreen may warn about an unknown
-publisher. Check the SHA-256 checksum from the release notes, then choose
-**More info → Run anyway**.
+Requirements: Windows 10 or 11 (x64) with the Microsoft Edge WebView2 runtime. It is part of
+Windows 11. The portable version does not install it; on Windows 10, get it from
+[Microsoft](https://developer.microsoft.com/microsoft-edge/webview2/) if needed.
+
+**The binaries are not code-signed**, so Windows SmartScreen may warn about an unknown
+publisher. Verify the download first:
+
+```
+Get-FileHash .\Ironsight_<version>_x64-setup.exe -Algorithm SHA256
+```
+
+The hash must match the line for that file in `SHA256SUMS.txt` (upper/lower case does not
+matter). Then choose **More info → Run anyway**.
 
 ## How it works
 
@@ -88,6 +99,10 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+Releases are made with `.\scripts\release.ps1`: it checks, builds the installer and the
+portable zip, writes `SHA256SUMS.txt` and publishes a GitHub release for the version in
+`src-tauri/tauri.conf.json` (`-NoPublish` only builds into `release/`).
 
 To refresh the vendor table, run `npm run update-oui`. It downloads the IEEE MA-L list and writes
 `src-tauri/data/oui.bin`, which is committed to the repository.
@@ -149,12 +164,19 @@ Informationen zu ihnen an und exportiert die Ergebnisse.
 - **Datenschutz:** keine Telemetrie, kein Netzwerkverkehr außer dem Scan. Ergebnisse werden nur
   beim Export gespeichert.
 
-### Installation
+### Download
 
-Lade `Ironsight_<version>_x64-setup.exe` von der
-[Release-Seite](https://github.com/MarCel06xX/ironsight/releases) und starte es. Die Installation
-erfolgt für den aktuellen Benutzer, Administratorrechte sind nicht nötig. Da der Installer noch
-nicht signiert ist, kann SmartScreen warnen: Prüfsumme aus den Release-Notes vergleichen, dann
+Auf der [Release-Seite](https://github.com/MarCel06xX/ironsight/releases) gibt es:
+
+- **Installer** (`…_x64-setup.exe`): Installation für den aktuellen Benutzer, ohne
+  Administratorrechte. Lädt die WebView2 Runtime nach, falls sie fehlt.
+- **Portable** (`…_x64-portable.zip`): entpacken und `Ironsight.exe` starten. Einstellungen und
+  WebView2-Profil liegen im Ordner `data` neben der exe statt in AppData.
+- **`SHA256SUMS.txt`** mit den Prüfsummen.
+
+Voraussetzung ist Windows 10/11 (x64) mit der Microsoft Edge WebView2 Runtime (in Windows 11
+enthalten). **Die Dateien sind nicht signiert**, daher kann SmartScreen warnen. Vorher prüfen mit
+`Get-FileHash .\<Datei> -Algorithm SHA256` und mit `SHA256SUMS.txt` vergleichen, dann
 **Weitere Informationen → Trotzdem ausführen**.
 
 Außerhalb des eigenen Netzwerksegments (hinter einem Router) funktioniert ARP nicht. MAC-Adresse

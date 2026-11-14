@@ -21,6 +21,7 @@ use crate::export::{
 };
 use crate::mac::MacAddr;
 use crate::platform::{self, Adapter, NetBackend};
+use crate::portable::PortableDir;
 use crate::scan::engine::{now_ms, run_scan};
 use crate::scan::range::{MAX_HOSTS, TargetSet};
 use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, HostResult, ScanBatch, ScanConfig};
@@ -245,7 +246,11 @@ pub fn stop_scan(state: State<'_, AppState>) {
     state.cancel_scan();
 }
 
+/// `data/settings.json` next to the exe in portable mode, otherwise in the app config dir.
 fn settings_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
+    if let Some(dir) = &app.state::<PortableDir>().0 {
+        return Ok(dir.join(settings::FILE_NAME));
+    }
     let dir = app
         .path()
         .app_config_dir()

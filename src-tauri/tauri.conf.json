@@ -18,7 +18,8 @@
         "width": 1200,
         "height": 760,
         "minWidth": 800,
-        "minHeight": 500
+        "minHeight": 500,
+        "create": false
       }
     ],
     "security": {
@@ -28,7 +29,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "license": "MIT OR Apache-2.0",
     "publisher": "MarCel06xX",
     "copyright": "Copyright (c) 2026 MarCel06xX. Licensed under MIT OR Apache-2.0.",
@@ -39,8 +42,14 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["English", "German"],
+        "languages": [
+          "English",
+          "German"
+        ],
         "displayLanguageSelector": false
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
       }
     },
     "icon": [

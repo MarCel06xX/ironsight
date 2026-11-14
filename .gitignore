@@ -21,3 +21,6 @@ dist-ssr/
 .DS_Store
 Thumbs.db
 *.sw?
+
+# Release output of scripts/release.ps1
+/release/

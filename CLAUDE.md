@@ -51,13 +51,17 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
 
 ## Releasing
 
-1. Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`.
-2. `npm run tauri build` (several minutes, LTO). The bundler fetches its NSIS toolchain into
-   `%LOCALAPPDATA%\tauri` on first use. Output:
-   `src-tauri/target/release/bundle/nsis/Ironsight_<version>_x64-setup.exe`.
-3. Commit, `git tag -a v<version>`, push with tags, then
-   `gh release create v<version> <installer> --notes-file <notes>` (notes include SHA-256).
-   The installer is unsigned (SmartScreen warning is documented in the README).
+Bump the version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` (+ `Cargo.lock` via
+`cargo check`) and `package.json` (`npm version X.Y.Z --no-git-tag-version`), commit, push, then
+run `.\scripts\release.ps1` (`-NoPublish` = build into `release/` only). It produces installer,
+portable zip and `SHA256SUMS.txt`, tags `vX.Y.Z` and creates the GitHub release.
+
+## Portable mode
+
+A file `portable` next to the exe -> settings in `<exe dir>/data/`, WebView2 profile in
+`data/webview` (window is created in `lib.rs` setup via `WebviewWindowBuilder::from_config` +
+`data_directory`; config has `create: false`). Falls back to AppData if `data/` is not writable.
+Logic in `portable.rs`. Normal mode: settings `%APPDATA%\<id>\`, WebView2 `%LOCALAPPDATA%\<id>\EBWebView`.
 
 ## Backend design (phase 1)
 
