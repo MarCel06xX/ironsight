@@ -68,7 +68,8 @@ password; the script only passes the path - never read/print/commit the private 
 - Updater: `tauri-plugin-updater` + `tauri-plugin-process`, used from the webview (`src/update.ts`;
   capabilities `updater:default`, `process:allow-restart`). Endpoint
   `https://github.com/MarCel06xX/ironsight/releases/latest/download/latest.json`, install mode
-  `passive`, `plugins.updater.pubkey` = content of `ironsight.key.pub`. Startup check 1.5 s after
+  `passive`, `requireSignedVersion: true` (CLI writes `version:` into the .sig trusted comment),
+  `plugins.updater.pubkey` = content of `ironsight.key.pub`. Startup check 1.5 s after
   launch, 8 s timeout, silent on errors; settings `checkUpdates` / `skippedVersion`. Portable
   build (`app_info().portable`) only opens the release page (`open_release_page`).
 

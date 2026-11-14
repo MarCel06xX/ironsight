@@ -1,6 +1,6 @@
 [package]
 name = "ironsight"
-version = "0.1.1"
+version = "0.1.2"
 description = "Ironsight – desktop network scanner (host discovery, device info, export)"
 authors = ["MarCel06xX"]
 edition = "2024"

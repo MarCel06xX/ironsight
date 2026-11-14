@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Ironsight",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "io.github.marcel06xx.ironsight",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -63,10 +63,11 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ0MjREMDJFMzQ2RkQ1QUIKUldTcjFXODBMdEFrUkRoZkdURXdKWDd2S0UvNW5BNWg4Um5xL2o1QXhvRmg4TktjcG5Rek5KRFoK",
       "endpoints": [
         "https://github.com/MarCel06xX/ironsight/releases/latest/download/latest.json"
       ],
+      "requireSignedVersion": true,
       "windows": {
         "installMode": "passive"
       }
