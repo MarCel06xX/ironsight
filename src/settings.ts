@@ -106,7 +106,9 @@ export class SettingsDialog {
       this.showError(t("settings.invalid"));
       return;
     }
+    if (!this.current) return;
     const next: Settings = {
+      ...this.current,
       theme: this.theme.value as ThemeName,
       language: this.language.value as LanguageSetting,
       concurrency,

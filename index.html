@@ -64,6 +64,7 @@
           <span data-i18n="filter.onlineOnly"></span>
         </label>
         <span id="shown-count" class="muted"></span>
+        <button id="export-btn" type="button" data-i18n="export.open" disabled></button>
       </div>
       <div class="workspace">
         <div id="table" tabindex="0" data-i18n-aria-label="table.label"></div>
@@ -73,6 +74,46 @@
 
     <div id="context-menu" class="menu" hidden></div>
     <div id="toast" class="toast" role="status" hidden></div>
+
+    <dialog id="export-dialog" aria-labelledby="export-title">
+      <form id="export-form" method="dialog" novalidate>
+        <h2 id="export-title" data-i18n="export.title"></h2>
+        <fieldset class="field">
+          <legend data-i18n="export.format"></legend>
+          <label class="radio">
+            <input type="radio" name="export-format" value="csv" checked />
+            <span data-i18n="export.formatCsv"></span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="export-format" value="json" />
+            <span data-i18n="export.formatJson"></span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="export-format" value="html" />
+            <span data-i18n="export.formatHtml"></span>
+          </label>
+        </fieldset>
+        <label id="export-delimiter-field" class="field">
+          <span data-i18n="export.delimiter"></span>
+          <select id="export-delimiter"></select>
+        </label>
+        <fieldset class="field">
+          <legend data-i18n="export.scope"></legend>
+          <label class="radio">
+            <input type="radio" name="export-scope" value="all" checked />
+            <span id="export-scope-all"></span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="export-scope" value="view" />
+            <span id="export-scope-view"></span>
+          </label>
+        </fieldset>
+        <div class="dialog-actions">
+          <button id="export-cancel" type="button" data-i18n="export.cancel"></button>
+          <button type="submit" class="primary" data-i18n="export.submit"></button>
+        </div>
+      </form>
+    </dialog>
 
     <dialog id="settings-dialog" aria-labelledby="settings-title">
       <form id="settings-form" method="dialog" novalidate>

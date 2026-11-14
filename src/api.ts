@@ -91,6 +91,8 @@ export interface ScanStarted {
 
 export type ThemeName = "dark" | "light" | "blue" | "terminal" | "purple";
 export type LanguageSetting = "system" | "en" | "de";
+export type CsvDelimiter = ";" | ",";
+export type ExportFormat = "csv" | "json" | "html";
 
 /** The only data that is persisted (settings.json in the app config directory). */
 export interface Settings {
@@ -98,6 +100,18 @@ export interface Settings {
   language: LanguageSetting;
   concurrency: number;
   timeoutMs: number;
+  /** Last delimiter used for CSV export. */
+  csvDelimiter: CsvDelimiter;
+}
+
+export interface ExportRequest {
+  format: ExportFormat;
+  delimiter: CsvDelimiter | null;
+  /** Rows of the filtered view in display order; `null` exports every scanned address. */
+  ips: string[] | null;
+  language: "en" | "de";
+  /** Local offset for timestamps in CSV/HTML, i.e. `-new Date().getTimezoneOffset()`. */
+  utcOffsetMinutes: number;
 }
 
 /** Error shape of all backend commands; `code` maps to the `error.<code>` message. */
@@ -135,6 +149,10 @@ export const openFileShare = (ip: string): Promise<void> => invoke("open_file_sh
 
 export const wakeOnLan = (mac: string, ip: string | null): Promise<void> =>
   invoke("wake_on_lan", { mac, ip });
+
+/** Shows the save dialog and writes the file; resolves to its path, or `null` if cancelled. */
+export const exportResults = (request: ExportRequest): Promise<string | null> =>
+  invoke("export_results", { request });
 
 export const onScanBatch = (handler: (batch: ScanBatch) => void): Promise<UnlistenFn> =>
   listen<ScanBatch>("scan:batch", (event) => handler(event.payload));

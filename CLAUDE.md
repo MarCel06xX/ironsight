@@ -6,11 +6,10 @@ Windows only. Port scanning / packet capture / Linux come later – keep platfor
 
 ## Current phase
 
-**Phase 3 done** (virtual table, sort/filter, details panel, context menu with copy/browser/
-RDP/Explorer/WoL, settings dialog + persistence, 5 themes, runtime i18n, localized errors).
-Next: **Phase 4** - export: CSV (UTF-8 BOM, `;` default or `,`), JSON (`schema_version`, scan
-metadata, all name sources/services), self-contained printable HTML report (escape everything);
-all rows or current filtered view; via `tauri-plugin-dialog` save dialog.
+**Phase 4 done** (export: CSV, JSON, HTML report; all addresses or the filtered view).
+Next: **Phase 5** - polish: README (English + German section, build instructions, features,
+screenshot placeholder, legal note), real app icons, `npm run tauri build` (NSIS), tag `v0.1.0`,
+GitHub release with the installer.
 
 Phases: 0 scaffold · 1 backend core · 2 enrichment · 3 UI · 4 export · 5 polish/release.
 After each phase: fmt + clippy + tests, commit, push, short summary, **wait for the user's OK**.
@@ -82,7 +81,7 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
 
 ## Frontend (`src/`)
 
-- `api.ts` typed invoke/listen wrappers + IPC types · `main.ts` wiring (scan flow, menu actions,
+- `api.ts` typed invoke/listen wrappers + IPC types · `export.ts` export dialog · `main.ts` wiring (scan flow, menu actions,
   error/toast, settings, language listener).
 - `store.ts` `HostStore`: Map ip -> host + precomputed search text/IP key; `rows()` = filtered +
   sorted view, cached until a change. Empty values sort last in both directions. 65,536 hosts:
@@ -113,9 +112,24 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
   length cap). Hostname priority: DNS > mDNS > NetBIOS (`hostnameSource`).
 - Lookup timeout = scan timeout clamped to 500-3000 ms.
 
-## Still planned
+## Export (phase 4, `src-tauri/src/export/`)
 
-`src-tauri/src/export/` (phase 4).
+- The backend keeps the last scan in memory (`commands::ScanRecord`, filled from the batch
+  callback, cleared when a new scan starts). `export_results` writes from that copy; the
+  frontend only sends the format, delimiter, language, UTC offset and - for "current view" - the
+  ordered IP list. No export while a scan runs.
+- Save dialog: `tauri-plugin-dialog` is registered (needed for the Rust API) but the webview has
+  no `dialog:*` permission. Non-blocking `save_file` + oneshot; missing extension is added.
+- `csv.rs`: BOM, CRLF, `;`/`,`, RFC 4180 quoting; network text starting with `= + - @ \t \r`
+  gets a leading `'` (formula injection). Timestamps local RFC 3339 with offset.
+- `json.rs`: own snake_case schema (`schema_version` 1, generator, exported_at, scope, scan
+  metadata, hosts with all names/services); UTC timestamps. Bump the version on breaking changes.
+- `html.rs`: one file, inline CSS, `<meta>` CSP `default-src 'none'`, everything escaped, A4
+  landscape print styles.
+- `labels.rs`: texts come from `src/locales/*.json` via `include_str!` (one catalog for UI and
+  exports); a test renders every format in both languages and fails on raw keys/placeholders.
+- `time.rs`: self-written civil-date conversion (no chrono). Settings now also store
+  `csvDelimiter` (remembered from the last CSV export).
 
 ## Commands
 

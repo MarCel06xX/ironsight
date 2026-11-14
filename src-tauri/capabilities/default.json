@@ -16,6 +16,7 @@
     "allow-open-in-browser",
     "allow-open-remote-desktop",
     "allow-open-file-share",
-    "allow-wake-on-lan"
+    "allow-wake-on-lan",
+    "allow-export-results"
   ]
 }

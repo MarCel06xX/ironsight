@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::export::Delimiter;
 use crate::scan::{ConfigError, DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, ScanConfig};
 
 pub const FILE_NAME: &str = "settings.json";
@@ -41,6 +42,8 @@ pub struct Settings {
     pub language: Language,
     pub concurrency: u32,
     pub timeout_ms: u32,
+    /// Last delimiter used for CSV export.
+    pub csv_delimiter: Delimiter,
 }
 
 impl Default for Settings {
@@ -50,6 +53,7 @@ impl Default for Settings {
             language: Language::default(),
             concurrency: DEFAULT_CONCURRENCY,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            csv_delimiter: Delimiter::Semicolon,
         }
     }
 }
@@ -124,6 +128,7 @@ mod tests {
             language: Language::De,
             concurrency: 128,
             timeout_ms: 2500,
+            csv_delimiter: Delimiter::Comma,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -148,7 +153,8 @@ mod tests {
                 "theme": "dark",
                 "language": "system",
                 "concurrency": 64,
-                "timeoutMs": 1000
+                "timeoutMs": 1000,
+                "csvDelimiter": ";"
             })
         );
     }
@@ -191,6 +197,7 @@ mod tests {
         let loaded = Settings::load(&path);
         assert_eq!(loaded.theme, Theme::Purple);
         assert_eq!(loaded.concurrency, DEFAULT_CONCURRENCY);
+        assert_eq!(loaded.csv_delimiter, Delimiter::Semicolon);
 
         fs::write(
             &path,

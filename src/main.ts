@@ -13,11 +13,13 @@ import {
   openFileShare,
   openInBrowser,
   openRemoteDesktop,
+  saveSettings,
   startScan,
   stopScan,
   wakeOnLan,
 } from "./api";
 import { renderDetails } from "./details";
+import { ExportDialog } from "./export";
 import {
   hostnameText,
   rttText,
@@ -50,6 +52,7 @@ const DEFAULT_SETTINGS: Settings = {
   language: "system",
   concurrency: 64,
   timeoutMs: 1000,
+  csvDelimiter: ";",
 };
 /** Minimum time between table refreshes while results stream in. */
 const REFRESH_INTERVAL_MS = 200;
@@ -67,6 +70,7 @@ const scanButton = byId<HTMLButtonElement>("scan-btn");
 const progressBar = byId<HTMLProgressElement>("progress");
 const progressText = byId<HTMLSpanElement>("progress-text");
 const settingsButton = byId<HTMLButtonElement>("settings-btn");
+const exportButton = byId<HTMLButtonElement>("export-btn");
 const errorBox = byId<HTMLParagraphElement>("error");
 const filterInput = byId<HTMLInputElement>("filter");
 const onlineOnlyBox = byId<HTMLInputElement>("only-online");
@@ -152,6 +156,7 @@ function refreshView(): void {
     shown: formatNumber(rows.length),
     total: formatNumber(store.total),
   });
+  exportButton.disabled = running || store.total === 0;
   updateDetails(false);
 }
 
@@ -287,6 +292,7 @@ function setRunning(value: boolean): void {
   stopping = false;
   targetInput.disabled = value;
   adapterSelect.disabled = value;
+  exportButton.disabled = value || store.total === 0;
   renderScanButton();
 }
 
@@ -424,6 +430,19 @@ onLanguageChange(() => {
 
 const settingsDialog = new SettingsDialog(byId("settings-dialog"), applySettings, errorText);
 
+const exportDialog = new ExportDialog(
+  byId("export-dialog"),
+  (path, delimiter) => {
+    toast.show(t("export.done", { path }));
+    // Remember the CSV delimiter for next time.
+    if (delimiter !== null && delimiter !== settings.csvDelimiter) {
+      settings = { ...settings, csvDelimiter: delimiter };
+      saveSettings(settings).catch((error: unknown) => toast.show(errorText(error), "error"));
+    }
+  },
+  (error) => toast.show(errorText(error), "error"),
+);
+
 function wireEvents(): void {
   adapterSelect.addEventListener("change", () => {
     if (adapterSelect.value !== "") targetInput.value = adapterSelect.value;
@@ -433,6 +452,13 @@ function wireEvents(): void {
     if (event.key === "Enter" && !running) void toggleScan();
   });
   settingsButton.addEventListener("click", () => settingsDialog.open(settings));
+  exportButton.addEventListener("click", () =>
+    exportDialog.open({
+      allCount: store.total,
+      viewIps: store.rows().map((host) => host.ip),
+      delimiter: settings.csvDelimiter,
+    }),
+  );
   filterInput.addEventListener("input", () => {
     window.clearTimeout(filterTimer);
     filterTimer = window.setTimeout(() => {

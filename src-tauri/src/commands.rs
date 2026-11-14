@@ -1,22 +1,29 @@
 //! Tauri commands. All input from the webview is validated here before it reaches the engine.
 
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::watch;
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tauri_plugin_dialog::DialogExt;
+use tokio::sync::{oneshot, watch};
 
 use crate::actions;
 use crate::enrich::NetEnricher;
 use crate::error::CommandError;
+use crate::export::{
+    self, Delimiter, ExportKind, ExportOptions, Labels, ReportLanguage, ScanInfo, Scope,
+};
 use crate::mac::MacAddr;
 use crate::platform::{self, Adapter, NetBackend};
-use crate::scan::engine::run_scan;
-use crate::scan::range::TargetSet;
-use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, ScanConfig};
+use crate::scan::engine::{now_ms, run_scan};
+use crate::scan::range::{MAX_HOSTS, TargetSet};
+use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, HostResult, ScanBatch, ScanConfig};
 use crate::settings::{self, Settings};
 
 pub const EVENT_SCAN_BATCH: &str = "scan:batch";
@@ -27,10 +34,39 @@ struct ActiveScan {
     cancel: watch::Sender<bool>,
 }
 
+/// Results of the most recent scan, kept in memory (never on disk) for manual export.
+struct ScanRecord {
+    scan_id: u64,
+    info: ScanInfo,
+    hosts: HashMap<IpAddr, HostResult>,
+}
+
+impl ScanRecord {
+    /// All hosts sorted by address, or the given addresses in their order (unknown and
+    /// repeated addresses are skipped).
+    fn select(&self, ips: Option<&[IpAddr]>) -> Vec<HostResult> {
+        match ips {
+            None => {
+                let mut hosts: Vec<HostResult> = self.hosts.values().cloned().collect();
+                hosts.sort_by_key(|host| host.ip);
+                hosts
+            }
+            Some(ips) => {
+                let mut seen = HashSet::new();
+                ips.iter()
+                    .filter(|ip| seen.insert(**ip))
+                    .filter_map(|ip| self.hosts.get(ip).cloned())
+                    .collect()
+            }
+        }
+    }
+}
+
 pub struct AppState {
     backend: Arc<dyn NetBackend>,
     active: Mutex<Option<ActiveScan>>,
     next_scan_id: AtomicU64,
+    last_scan: Mutex<Option<ScanRecord>>,
 }
 
 impl AppState {
@@ -39,6 +75,23 @@ impl AppState {
             backend,
             active: Mutex::new(None),
             next_scan_id: AtomicU64::new(1),
+            last_scan: Mutex::new(None),
+        }
+    }
+
+    fn last_scan(&self) -> MutexGuard<'_, Option<ScanRecord>> {
+        self.last_scan.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_scanning(&self) -> bool {
+        self.active().is_some()
+    }
+
+    fn record_hosts(&self, scan_id: u64, hosts: Vec<HostResult>) {
+        if let Some(record) = self.last_scan().as_mut().filter(|r| r.scan_id == scan_id) {
+            for host in hosts {
+                record.hosts.insert(host.ip, host);
+            }
         }
     }
 
@@ -51,10 +104,7 @@ impl AppState {
     fn begin_scan(&self) -> Result<(u64, watch::Receiver<bool>), CommandError> {
         let mut active = self.active();
         if active.is_some() {
-            return Err(CommandError::new(
-                "scan.already_running",
-                "a scan is already running",
-            ));
+            return Err(already_running());
         }
         let id = self.next_scan_id.fetch_add(1, Ordering::Relaxed);
         let (cancel, cancelled) = watch::channel(false);
@@ -97,6 +147,10 @@ fn scan_config(request: &ScanRequest) -> Result<ScanConfig, CommandError> {
     Ok(ScanConfig::new(concurrency, timeout_ms)?)
 }
 
+fn already_running() -> CommandError {
+    CommandError::new("scan.already_running", "a scan is already running")
+}
+
 fn internal(error: impl std::fmt::Display) -> CommandError {
     CommandError::new("internal", error.to_string())
 }
@@ -122,16 +176,40 @@ pub async fn start_scan(
     state: State<'_, AppState>,
     request: ScanRequest,
 ) -> Result<ScanStarted, CommandError> {
+    if state.is_scanning() {
+        return Err(already_running());
+    }
+    // The frontend clears its table when a scan is started; keep the export data in step.
+    *state.last_scan() = None;
     let targets = TargetSet::parse(&request.targets)?;
     let config = scan_config(&request)?;
     let total = targets.len() as u32;
     let (scan_id, cancel) = state.begin_scan()?;
     let backend = Arc::clone(&state.backend);
+    *state.last_scan() = Some(ScanRecord {
+        scan_id,
+        info: ScanInfo {
+            targets: request.targets.trim().to_owned(),
+            started_at_ms: now_ms(),
+            finished_at_ms: None,
+            cancelled: false,
+            total,
+            scanned: 0,
+            online: 0,
+            errors: 0,
+            concurrency: config.concurrency as u32,
+            timeout_ms: config.timeout.as_millis() as u32,
+        },
+        hosts: HashMap::new(),
+    });
 
     tauri::async_runtime::spawn(async move {
         let emitter = app.clone();
-        let on_batch = move |batch| {
-            let _ = emitter.emit(EVENT_SCAN_BATCH, batch);
+        let on_batch = move |batch: ScanBatch| {
+            let _ = emitter.emit(EVENT_SCAN_BATCH, &batch);
+            emitter
+                .state::<AppState>()
+                .record_hosts(scan_id, batch.hosts);
         };
         // The enricher needs the adapters to pick DNS servers; a failure only costs names.
         let adapters = {
@@ -144,8 +222,18 @@ pub async fn start_scan(
         };
         let probes = Arc::new(NetEnricher::new(&adapters));
         let summary = run_scan(backend, probes, targets, config, cancel, scan_id, on_batch).await;
+        let state = app.state::<AppState>();
+        if let Some(record) = state.last_scan().as_mut().filter(|r| r.scan_id == scan_id) {
+            let info = &mut record.info;
+            info.started_at_ms = summary.started_at_ms;
+            info.finished_at_ms = Some(summary.finished_at_ms);
+            info.cancelled = summary.cancelled;
+            info.scanned = summary.scanned;
+            info.online = summary.online;
+            info.errors = summary.errors;
+        }
         // Free the slot first, so the frontend can start a new scan right after the event.
-        app.state::<AppState>().end_scan(scan_id);
+        state.end_scan(scan_id);
         let _ = app.emit(EVENT_SCAN_FINISHED, summary);
     });
 
@@ -238,11 +326,204 @@ pub async fn wake_on_lan(
     .map_err(|e| io_error("action.wol_failed", e))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExportRequest {
+    format: ExportKind,
+    delimiter: Option<Delimiter>,
+    /// Rows of the filtered view in display order; `None` exports every scanned address.
+    ips: Option<Vec<IpAddr>>,
+    language: ReportLanguage,
+    /// Local time offset for CSV and HTML timestamps (JavaScript's `-getTimezoneOffset()`).
+    utc_offset_minutes: i32,
+}
+
+impl ExportRequest {
+    fn options(&self) -> Result<ExportOptions, CommandError> {
+        let max = export::time::MAX_OFFSET_MINUTES;
+        if !(-max..=max).contains(&self.utc_offset_minutes) {
+            return Err(CommandError::new(
+                "export.invalid_request",
+                "invalid UTC offset",
+            ));
+        }
+        if self
+            .ips
+            .as_ref()
+            .is_some_and(|ips| ips.len() as u64 > MAX_HOSTS)
+        {
+            return Err(CommandError::new("export.invalid_request", "too many rows"));
+        }
+        Ok(ExportOptions {
+            kind: self.format,
+            delimiter: self.delimiter.unwrap_or_default(),
+            language: self.language,
+            utc_offset_minutes: self.utc_offset_minutes,
+            scope: if self.ips.is_some() {
+                Scope::View
+            } else {
+                Scope::All
+            },
+            exported_at_ms: now_ms(),
+        })
+    }
+}
+
+/// Asks for a file name and writes the export. Returns the written path, or `None` if the
+/// save dialog was cancelled.
+#[tauri::command]
+pub async fn export_results(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    request: ExportRequest,
+) -> Result<Option<String>, CommandError> {
+    let options = request.options()?;
+    if state.is_scanning() {
+        return Err(CommandError::new(
+            "export.scan_running",
+            "a scan is still running",
+        ));
+    }
+    let no_results = || CommandError::new("export.no_results", "nothing to export");
+    let (info, hosts) = {
+        let last = state.last_scan();
+        let record = last.as_ref().ok_or_else(no_results)?;
+        (record.info.clone(), record.select(request.ips.as_deref()))
+    };
+    if hosts.is_empty() {
+        return Err(no_results());
+    }
+
+    let labels = Labels::new(options.language);
+    let extension = options.kind.extension();
+    let (tx, rx) = oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .set_file_name(export::default_file_name(&options, info.started_at_ms))
+        .add_filter(labels.get(options.kind.label_key()), &[extension])
+        .save_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let Some(path) = rx.await.ok().flatten() else {
+        return Ok(None);
+    };
+    let mut path = path.into_path().map_err(|e| io_error("export.io", e))?;
+    if path.extension().is_none() {
+        path.set_extension(extension);
+    }
+
+    let shown = path.display().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = BufWriter::new(File::create(&path)?);
+        export::write_export(&mut out, &info, &hosts, &options)?;
+        out.flush()
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|e| io_error("export.io", e))?;
+    Ok(Some(shown))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
     use std::time::Duration;
 
     use super::*;
+
+    fn record(last_octets: &[u8]) -> ScanRecord {
+        let hosts = last_octets
+            .iter()
+            .map(|&d| {
+                let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, d));
+                (ip, HostResult::new(ip))
+            })
+            .collect();
+        ScanRecord {
+            scan_id: 1,
+            info: ScanInfo {
+                targets: "10.0.0.0/24".into(),
+                started_at_ms: 0,
+                finished_at_ms: Some(1),
+                cancelled: false,
+                total: 254,
+                scanned: 254,
+                online: 0,
+                errors: 0,
+                concurrency: 64,
+                timeout_ms: 1000,
+            },
+            hosts,
+        }
+    }
+
+    fn ip(d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, d))
+    }
+
+    #[test]
+    fn export_selection() {
+        let record = record(&[20, 3, 100, 9]);
+        let all: Vec<IpAddr> = record.select(None).iter().map(|h| h.ip).collect();
+        assert_eq!(all, [ip(3), ip(9), ip(20), ip(100)]);
+
+        // View order is kept; unknown and repeated addresses are dropped.
+        let view = [ip(100), ip(3), ip(77), ip(100), ip(20)];
+        let picked: Vec<IpAddr> = record.select(Some(&view)).iter().map(|h| h.ip).collect();
+        assert_eq!(picked, [ip(100), ip(3), ip(20)]);
+        assert!(record.select(Some(&[])).is_empty());
+    }
+
+    #[test]
+    fn hosts_are_recorded_for_the_current_scan_only() {
+        let state = AppState::new(default_backend());
+        *state.last_scan() = Some(record(&[]));
+        state.record_hosts(2, vec![HostResult::new(ip(1))]);
+        assert!(state.last_scan().as_ref().unwrap().hosts.is_empty());
+        state.record_hosts(1, vec![HostResult::new(ip(1)), HostResult::new(ip(2))]);
+        let mut updated = HostResult::new(ip(1));
+        updated.online = true;
+        state.record_hosts(1, vec![updated]);
+        let last = state.last_scan();
+        let hosts = &last.as_ref().unwrap().hosts;
+        assert_eq!(hosts.len(), 2);
+        assert!(hosts[&ip(1)].online);
+    }
+
+    #[test]
+    fn export_request_validation() {
+        let parse = |json: &str| serde_json::from_str::<ExportRequest>(json);
+        let ok = parse(
+            r#"{"format":"csv","delimiter":",","ips":null,"language":"de","utcOffsetMinutes":60}"#,
+        )
+        .unwrap();
+        let options = ok.options().unwrap();
+        assert_eq!(options.delimiter, Delimiter::Comma);
+        assert_eq!(options.scope, Scope::All);
+        assert_eq!(options.language, ReportLanguage::De);
+
+        let view = parse(
+            r#"{"format":"html","ips":["10.0.0.1"],"language":"en","utcOffsetMinutes":-300}"#,
+        )
+        .unwrap();
+        assert_eq!(view.options().unwrap().scope, Scope::View);
+        assert_eq!(view.options().unwrap().delimiter, Delimiter::Semicolon);
+
+        let far = parse(r#"{"format":"json","language":"en","utcOffsetMinutes":900}"#).unwrap();
+        assert_eq!(far.options().unwrap_err().code, "export.invalid_request");
+
+        for bad in [
+            r#"{"format":"xlsx","language":"en","utcOffsetMinutes":0}"#,
+            r#"{"format":"csv","delimiter":"|","language":"en","utcOffsetMinutes":0}"#,
+            r#"{"format":"csv","language":"fr","utcOffsetMinutes":0}"#,
+            r#"{"format":"csv","ips":["not-an-ip"],"language":"en","utcOffsetMinutes":0}"#,
+            r#"{"format":"csv","language":"en","utcOffsetMinutes":0,"path":"C:\x"}"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
     use crate::platform::default_backend;
 
     fn request(concurrency: Option<u32>, timeout_ms: Option<u32>) -> ScanRequest {

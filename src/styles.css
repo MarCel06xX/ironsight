@@ -147,7 +147,7 @@ body {
 /* --- controls ------------------------------------------------------------------- */
 
 select,
-input:not([type="checkbox"]),
+input:not([type="checkbox"], [type="radio"]),
 button {
   height: 32px;
   padding: 0 10px;
@@ -196,7 +196,8 @@ input[aria-invalid="true"] {
   border-color: var(--danger);
 }
 
-input[type="checkbox"] {
+input[type="checkbox"],
+input[type="radio"] {
   accent-color: var(--accent);
 }
 
@@ -260,6 +261,10 @@ progress {
   gap: 8px 16px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
+}
+
+#export-btn {
+  margin-left: auto;
 }
 
 #filter {
@@ -549,6 +554,25 @@ dialog h2 {
   display: grid;
   gap: 4px;
   margin-bottom: 14px;
+}
+
+fieldset.field {
+  padding: 0;
+  margin: 0 0 14px;
+  border: 0;
+}
+
+fieldset.field legend {
+  padding: 0;
+  margin-bottom: 4px;
+}
+
+.radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  cursor: pointer;
 }
 
 .field small {

@@ -11,6 +11,7 @@ fn main() {
         "open_remote_desktop",
         "open_file_share",
         "wake_on_lan",
+        "export_results",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("failed to run tauri-build");
