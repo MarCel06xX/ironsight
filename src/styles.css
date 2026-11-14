@@ -136,6 +136,17 @@ td {
   border-bottom: 1px solid var(--border);
 }
 
+td {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Lookups for this host are still running. */
+tr.pending td {
+  color: var(--fg-muted);
+}
+
 th {
   position: sticky;
   top: 0;

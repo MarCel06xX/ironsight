@@ -6,9 +6,10 @@ Windows only. Port scanning / packet capture / Linux come later – keep platfor
 
 ## Current phase
 
-**Phase 1 done** (range parser, adapters, ARP + ICMP discovery, live events, minimal table).
-Next: **Phase 2** - enrichment: DNS (PTR), NetBIOS, mDNS, OUI (+ converter script), service
-probes, HTTP title.
+**Phase 2 done** (enrichment: DNS PTR, mDNS, NetBIOS NBSTAT, OUI vendor, TCP service probes,
+HTTP Server/title; extra columns in the provisional table).
+Next: **Phase 3** - UI: virtual table, sort/filter, details panel, context menu (copy, browser,
+RDP, Explorer, WoL), settings dialog, 5 themes, i18n switch, localized backend error codes.
 
 Phases: 0 scaffold · 1 backend core · 2 enrichment · 3 UI · 4 export · 5 polish/release.
 After each phase: fmt + clippy + tests, commit, push, short summary, **wait for the user's OK**.
@@ -52,13 +53,16 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
 - `platform/`: sync, blocking `NetBackend` trait (`list_adapters`, `arp_resolve`, `icmp_ping`);
   `windows.rs` = IP Helper (`GetAdaptersAddresses`, `SendARP`, `IcmpSendEcho`), `windows` crate 0.62
   (same version Tauri pulls in). `unsupported.rs` keeps other OSes compiling.
-- `scan/engine.rs`: `run_scan(backend, targets, config, cancel, id, on_batch)`; Tauri-free, tested
-  with a mock backend. Host slots = concurrency semaphore; ARP only for on-link targets (own
-  address: no ARP, MAC from adapter). SendARP blocks ~3 s on silent hosts and cannot be aborted, so
-  the host is reported after `timeout` while the thread finishes under a separate ARP-slot
-  semaphore (max 240 threads, tokio blocking pool is 512).
+- `scan/engine.rs`: `run_scan(backend, probes, targets, config, cancel: watch::Receiver<bool>, id,
+  on_batch)`; Tauri-free, tested with `MockBackend` + `MockProbes`. Host slots = concurrency
+  semaphore (held through enrichment). ARP only for on-link targets (own address: no ARP, MAC from
+  adapter). SendARP blocks ~1-3 s and cannot be aborted: the first report comes after `timeout`,
+  the still-running ARP call is awaited afterwards (adds the MAC, or revives a host first reported
+  offline). Stop drops all pending lookups via `tokio::select!` on the watch channel.
+- `HostProbes` trait (engine) = socket-based TCP probe + enrichment, implemented by
+  `enrich::NetEnricher` (DNS servers per adapter from `GetAdaptersAddresses`).
 - Events: `scan:batch` (`ScanBatch`: host upserts keyed by IP + totals, flushed every 100 ms or 512
-  hosts; offline hosts are sent too) and `scan:finished` (`ScanSummary`). One scan at a time.
+  hosts; offline hosts are sent too; online hosts come again with `complete: true`) and `scan:finished` (`ScanSummary`). One scan at a time.
 - IPC JSON is camelCase. Command errors are `{ code, message }`; `code` is meant for i18n
   (frontend still shows the English `message` - localize in phase 3).
 - App commands are listed in `build.rs` (`AppManifest::commands`) and must also be allowed in
@@ -72,10 +76,24 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
 `data-i18n*` attributes, `de` is type-checked against `en`) · `src/main.ts` simple online-only table,
 to be replaced by the virtual table in phase 3.
 
-## Still planned (`src-tauri/src/`)
+## Enrichment (phase 2, `src-tauri/src/enrich/`)
 
-`enrich/{dns,netbios,mdns,oui,services}.rs` · `export/`. OUI converter: `tools/oui/` (raw CSV is
-git-ignored).
+- `wire.rs` DNS message builder/parser (PTR only; compression with backward-only pointers, jump
+  limit, RDATA bounds) shared by `dns.rs` (system DNS servers, max 2) and `mdns.rs` (unicast
+  one-shot query to `<ip>:5353`, on-link hosts only). `netbios.rs` NBSTAT `*` query on UDP 137.
+- `services.rs`: TCP connect on 21,22,23,80,443,445,3389,8080,8443; HTTP/1.0 `GET /` on 80/8080
+  only, max 64 KiB, max 3 redirects and only same host+port (never follow to other hosts).
+  HTTPS titles need a TLS crate -> not added, ask the user first.
+- `oui.rs`: binary table `src-tauri/data/oui.bin` (`IOUI` v1, sorted 3-byte prefixes + u24 name
+  offsets, ~700 KB), built by `npm run update-oui` (`tools/oui/update-oui.mjs`; raw CSV never in
+  context). Locally administered MACs (bit 0x02) get `macLocal: true` and no vendor.
+- All network strings go through `clean_text` (controls -> space, bidi/zero-width removed,
+  length cap). Hostname priority: DNS > mDNS > NetBIOS (`hostnameSource`).
+- Lookup timeout = scan timeout clamped to 500-3000 ms.
+
+## Still planned
+
+`src-tauri/src/export/` (phase 4).
 
 ## Commands
 
@@ -83,5 +101,6 @@ git-ignored).
 npm run typecheck                                   # tsc strict
 cd src-tauri && cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 cargo test live_scan -- --ignored --nocapture       # real scan of the local /24 (manual)
+npm run update-oui                                  # refresh the embedded IEEE OUI table
 npm run tauri dev                                   # user runs this
 ```

@@ -2,6 +2,7 @@
 // scrolling, sorting, filter, details) replaces the simple one below in phase 3.
 import {
   type HostResult,
+  type NameSource,
   type ScanBatch,
   type ScanSummary,
   isCommandError,
@@ -61,22 +62,57 @@ function setProgress(scanned: number, total: number, online: number, status?: Me
 
 function addCell(row: HTMLTableRowElement, text: string): void {
   // textContent only: everything shown here ultimately comes from the network.
-  row.insertCell().textContent = text;
+  const cell = row.insertCell();
+  cell.textContent = text;
+  cell.title = text; // full value for truncated cells (plain text, not HTML)
+}
+
+const SOURCE_KEYS: Record<NameSource, MessageKey> = {
+  dns: "source.dns",
+  mdns: "source.mdns",
+  netbios: "source.netbios",
+};
+
+function hostnameText(host: HostResult): string {
+  if (host.hostname !== null && host.hostnameSource !== null) {
+    const source = t(SOURCE_KEYS[host.hostnameSource]);
+    return t("host.nameWithSource", { name: host.hostname, source });
+  }
+  return host.complete ? "" : t("host.pending");
+}
+
+function vendorText(host: HostResult): string {
+  if (host.macLocal) return t("vendor.local");
+  return host.vendor ?? "";
+}
+
+/** First HTTP title, otherwise the first `Server` header. */
+function httpText(host: HostResult): string {
+  const infos = host.services.flatMap((service) => (service.http ? [service.http] : []));
+  const title = infos.find((info) => info.title !== null)?.title;
+  return title ?? infos.find((info) => info.server !== null)?.server ?? "";
 }
 
 function renderRow(row: HTMLTableRowElement, host: HostResult): void {
   row.replaceChildren();
+  row.classList.toggle("pending", !host.complete);
   const via: string[] = [];
   if (ownAddresses.has(host.ip)) via.push(t("seenBy.self"));
   if (host.seenBy.arp) via.push(t("seenBy.arp"));
   if (host.seenBy.icmp) via.push(t("seenBy.icmp"));
+  if (host.seenBy.tcp) via.push(t("seenBy.tcp"));
   let rtt = "";
   if (host.rttMs !== null) {
     rtt = host.rttMs === 0 ? t("rtt.subMs") : t("rtt.ms", { ms: host.rttMs });
   }
   addCell(row, host.ip);
+  addCell(row, hostnameText(host));
   addCell(row, host.mac ?? "");
+  addCell(row, vendorText(host));
   addCell(row, rtt);
+  addCell(row, host.services.map((service) => `${service.port} ${service.name}`).join(", "));
+  addCell(row, httpText(host));
+  addCell(row, host.workgroup ?? "");
   addCell(row, via.join(", "));
 }
 

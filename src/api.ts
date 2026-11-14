@@ -18,13 +18,43 @@ export interface Adapter {
   hasGateway: boolean;
 }
 
+export type NameSource = "dns" | "mdns" | "netbios";
+
+export interface HttpInfo {
+  status: number | null;
+  server: string | null;
+  title: string | null;
+}
+
+export interface ServiceInfo {
+  port: number;
+  name: string;
+  /** Filled for plain-HTTP ports that answered a `GET /`. */
+  http: HttpInfo | null;
+}
+
+/**
+ * One scanned address. Arrives once after probing and, for online hosts, again with
+ * `complete = true` after enrichment: always upsert by `ip`.
+ * All strings except `ip`, `mac` and `name` are untrusted network data: `textContent` only.
+ */
 export interface HostResult {
   ip: string;
   online: boolean;
-  mac: string | null;
+  /** `false` while name and service lookups are still running. */
+  complete: boolean;
+  seenBy: { arp: boolean; icmp: boolean; tcp: boolean };
   /** ICMP round-trip time; 0 means below one millisecond. */
   rttMs: number | null;
-  seenBy: { arp: boolean; icmp: boolean };
+  mac: string | null;
+  /** Locally administered (randomized/private or virtual) MAC: never has a vendor. */
+  macLocal: boolean;
+  vendor: string | null;
+  hostname: string | null;
+  hostnameSource: NameSource | null;
+  names: { dns: string | null; mdns: string | null; netbios: string | null };
+  workgroup: string | null;
+  services: ServiceInfo[];
   timestampMs: number;
 }
 
