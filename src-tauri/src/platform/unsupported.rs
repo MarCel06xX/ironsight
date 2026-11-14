@@ -3,7 +3,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use super::{Adapter, NetBackend, NetError};
+use super::{Adapter, LaunchError, NetBackend, NetError};
 use crate::mac::MacAddr;
 
 pub struct UnsupportedBackend;
@@ -24,4 +24,12 @@ impl NetBackend for UnsupportedBackend {
     fn icmp_ping(&self, _target: IpAddr, _timeout: Duration) -> Result<Option<Duration>, NetError> {
         Err(NetError::Unsupported)
     }
+}
+
+pub fn open_remote_desktop(_ip: IpAddr) -> Result<(), LaunchError> {
+    Err(LaunchError::Unsupported)
+}
+
+pub fn open_file_share(_ip: IpAddr) -> Result<(), LaunchError> {
+    Err(LaunchError::Unsupported)
 }

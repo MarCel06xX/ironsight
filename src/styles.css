@@ -1,15 +1,105 @@
-/* Themes are plain CSS custom properties, switched via <html data-theme="…">. */
+/* Themes: colors only, as CSS custom properties, switched via <html data-theme="…">.
+   Layout is identical in every theme. */
+:root {
+  --row-height: 28px; /* keep in sync with ROW_HEIGHT in table.ts */
+  --vt-columns: 96px 130px minmax(160px, 1.4fr) 150px minmax(140px, 1fr) 72px
+    minmax(120px, 1fr) minmax(140px, 1fr) 120px;
+  --vt-min-width: 1130px;
+}
+
 :root,
 :root[data-theme="dark"] {
   --bg: #16181d;
   --bg-raised: #1e2128;
   --bg-input: #101216;
+  --bg-hover: #252a33;
+  --bg-selected: #2b3d5c;
   --border: #2e333d;
+  --border-soft: #22262d;
   --fg: #e6e8ec;
   --fg-muted: #9aa1ad;
   --accent: #4c8dff;
   --accent-fg: #ffffff;
   --danger: #ff6b6b;
+  --online: #3ecf8e;
+  --offline: #5d6470;
+  --shadow: rgb(0 0 0 / 45%);
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #f6f7f9;
+  --bg-raised: #ffffff;
+  --bg-input: #ffffff;
+  --bg-hover: #eef1f5;
+  --bg-selected: #dbe7ff;
+  --border: #d5d9e0;
+  --border-soft: #e8ebf0;
+  --fg: #1d2330;
+  --fg-muted: #5d6675;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --danger: #c62828;
+  --online: #1f9d55;
+  --offline: #a0a7b3;
+  --shadow: rgb(15 23 42 / 18%);
+  color-scheme: light;
+}
+
+:root[data-theme="blue"] {
+  --bg: #0b1a33;
+  --bg-raised: #10244a;
+  --bg-input: #081428;
+  --bg-hover: #16305c;
+  --bg-selected: #1e4a8a;
+  --border: #1f3a66;
+  --border-soft: #142b52;
+  --fg: #e3ecff;
+  --fg-muted: #8fa6cc;
+  --accent: #4da3ff;
+  --accent-fg: #04122b;
+  --danger: #ff7a7a;
+  --online: #4ade80;
+  --offline: #4f6385;
+  --shadow: rgb(0 0 0 / 50%);
+  color-scheme: dark;
+}
+
+:root[data-theme="terminal"] {
+  --bg: #050a05;
+  --bg-raised: #0b140b;
+  --bg-input: #020502;
+  --bg-hover: #102010;
+  --bg-selected: #143d14;
+  --border: #1d3a1d;
+  --border-soft: #0f1f0f;
+  --fg: #7dff7d;
+  --fg-muted: #4fa84f;
+  --accent: #39ff14;
+  --accent-fg: #021002;
+  --danger: #ff5555;
+  --online: #39ff14;
+  --offline: #2f5f2f;
+  --shadow: rgb(0 0 0 / 60%);
+  color-scheme: dark;
+}
+
+:root[data-theme="purple"] {
+  --bg: #17111f;
+  --bg-raised: #21182d;
+  --bg-input: #120d19;
+  --bg-hover: #2b2040;
+  --bg-selected: #45306b;
+  --border: #352850;
+  --border-soft: #261d36;
+  --fg: #ede6f7;
+  --fg-muted: #a596bd;
+  --accent: #a970ff;
+  --accent-fg: #ffffff;
+  --danger: #ff6b8b;
+  --online: #5eead4;
+  --offline: #64597a;
+  --shadow: rgb(0 0 0 / 50%);
   color-scheme: dark;
 }
 
@@ -34,6 +124,7 @@ body {
     14px/1.4 "Segoe UI",
     system-ui,
     sans-serif;
+  overflow: hidden;
 }
 
 #app {
@@ -41,6 +132,86 @@ body {
   flex-direction: column;
   height: 100%;
 }
+
+.muted {
+  color: var(--fg-muted);
+}
+
+.offscreen {
+  position: fixed;
+  top: 0;
+  left: -9999px;
+  opacity: 0;
+}
+
+/* --- controls ------------------------------------------------------------------- */
+
+select,
+input:not([type="checkbox"]),
+button {
+  height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+button.primary {
+  min-width: 84px;
+  color: var(--accent-fg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.1);
+}
+
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  padding: 0;
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.error {
+  margin: 0;
+  padding: 8px 12px;
+  color: var(--danger);
+}
+
+/* --- top bar and toolbar ------------------------------------------------------------ */
 
 .topbar {
   display: flex;
@@ -52,19 +223,7 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
-select,
-input,
-button {
-  height: 32px;
-  padding: 0 10px;
-  font: inherit;
-  color: var(--fg);
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-}
-
-select {
+#adapter {
   max-width: 320px;
 }
 
@@ -72,26 +231,6 @@ select {
   flex: 1 1 220px;
   min-width: 160px;
   font-family: Consolas, "Cascadia Mono", monospace;
-}
-
-button {
-  min-width: 84px;
-  color: var(--accent-fg);
-  background: var(--accent);
-  border-color: var(--accent);
-  cursor: pointer;
-}
-
-button:disabled,
-input:disabled,
-select:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
 }
 
 .progress {
@@ -110,47 +249,318 @@ progress {
   accent-color: var(--accent);
 }
 
-.error {
-  margin: 0;
-  padding: 8px 12px;
-  color: var(--danger);
+#app > .error {
   border-bottom: 1px solid var(--border);
 }
 
-.results {
-  flex: 1;
-  overflow: auto;
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
 }
 
-table {
-  width: 100%;
-  border-collapse: collapse;
+#filter {
+  flex: 0 1 360px;
+  min-width: 180px;
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+/* --- results table ------------------------------------------------------------------ */
+
+.workspace {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.vtable {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
   font-variant-numeric: tabular-nums;
 }
 
-th,
-td {
-  padding: 6px 12px;
-  text-align: left;
-  white-space: nowrap;
+.vtable:focus-visible {
+  outline-offset: -2px;
+}
+
+.vt-grid {
+  display: grid;
+  grid-template-columns: var(--vt-columns);
+  min-width: var(--vt-min-width);
+}
+
+.vt-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-raised);
   border-bottom: 1px solid var(--border);
 }
 
-td {
-  max-width: 320px;
+.vt-th button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 0 10px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-align: left;
+  white-space: nowrap;
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+
+.vt-th button:hover:not(:disabled) {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+
+.vt-th-label {
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* Lookups for this host are still running. */
-tr.pending td {
+.vt-sort {
+  font-size: 10px;
+}
+
+.vt-th[aria-sort="ascending"] .vt-sort::after {
+  content: "▲";
+}
+
+.vt-th[aria-sort="descending"] .vt-sort::after {
+  content: "▼";
+}
+
+.vt-th[aria-sort="ascending"] button,
+.vt-th[aria-sort="descending"] button {
+  color: var(--fg);
+}
+
+.vt-body {
+  position: relative;
+  min-width: var(--vt-min-width);
+}
+
+.vt-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: var(--row-height);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.vt-row:hover {
+  background: var(--bg-hover);
+}
+
+.vt-row.selected {
+  background: var(--bg-selected);
+}
+
+.vt-row.offline {
   color: var(--fg-muted);
 }
 
-th {
-  position: sticky;
-  top: 0;
+.vt-cell {
+  padding: 0 10px;
+  overflow: hidden;
+  line-height: calc(var(--row-height) - 1px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vt-empty {
+  padding: 32px 16px;
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 8px;
+  vertical-align: 1px;
+  background: var(--offline);
+  border-radius: 50%;
+}
+
+.dot.online {
+  background: var(--online);
+}
+
+.dot.pending {
+  background: var(--online);
+  opacity: 0.45;
+}
+
+/* --- details panel ------------------------------------------------------------------- */
+
+.details {
+  flex: none;
+  width: 320px;
+  padding: 12px 14px;
+  overflow: auto;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+}
+
+.details h2 {
+  margin: 0 0 10px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.details-name {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.details dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 8px 0 0;
+}
+
+.details dt {
+  color: var(--fg-muted);
+}
+
+.details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.service + .service {
+  margin-top: 6px;
+}
+
+.service-name {
+  font-weight: 600;
+}
+
+.note {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+@media (width < 1000px) {
+  .details {
+    width: 260px;
+  }
+}
+
+/* --- context menu, toast, dialog ------------------------------------------------------- */
+
+.menu {
+  position: fixed;
+  z-index: 10;
+  min-width: 230px;
+  padding: 4px;
   background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px var(--shadow);
+}
+
+.menu button {
+  display: block;
+  width: 100%;
+  height: 30px;
+  padding: 0 12px;
+  text-align: left;
+  background: none;
+  border: 0;
+}
+
+.menu button:hover:not(:disabled),
+.menu button:focus-visible {
+  color: var(--accent-fg);
+  background: var(--accent);
+  outline: none;
+}
+
+.menu-separator {
+  margin: 4px 0;
+  border-top: 1px solid var(--border);
+}
+
+.toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 20;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 14px;
+  overflow-wrap: anywhere;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px var(--shadow);
+}
+
+.toast[data-kind="error"] {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+dialog {
+  width: min(440px, calc(100vw - 32px));
+  padding: 20px;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 16px 48px var(--shadow);
+}
+
+dialog::backdrop {
+  background: rgb(0 0 0 / 45%);
+}
+
+dialog h2 {
+  margin: 0 0 16px;
+  font-size: 18px;
+}
+
+.field {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.field small {
+  color: var(--fg-muted);
+}
+
+dialog .error {
+  padding: 0 0 12px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }

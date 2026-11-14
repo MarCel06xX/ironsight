@@ -10,7 +10,7 @@
   <body>
     <div id="app">
       <header class="topbar">
-        <select id="adapter" data-i18n-title="adapter.label"></select>
+        <select id="adapter" data-i18n-title="adapter.label" data-i18n-aria-label="adapter.label"></select>
         <input
           id="targets"
           type="text"
@@ -18,32 +18,89 @@
           autocomplete="off"
           maxlength="4096"
           data-i18n-placeholder="scan.targetPlaceholder"
+          data-i18n-aria-label="scan.targetLabel"
         />
-        <button id="scan-btn" type="button"></button>
+        <button id="scan-btn" type="button" class="primary"></button>
         <div class="progress">
           <progress id="progress" value="0" max="1"></progress>
-          <span id="progress-text"></span>
+          <span id="progress-text" aria-live="polite"></span>
         </div>
+        <button
+          id="settings-btn"
+          type="button"
+          class="icon-button"
+          data-i18n-title="settings.open"
+          data-i18n-aria-label="settings.open"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="18"
+            height="18"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="3" />
+            <circle cx="12" cy="12" r="6.5" />
+            <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1" />
+          </svg>
+        </button>
       </header>
       <p id="error" class="error" role="alert" hidden></p>
-      <main class="results">
-        <table>
-          <thead>
-            <tr>
-              <th data-i18n="col.ip"></th>
-              <th data-i18n="col.hostname"></th>
-              <th data-i18n="col.mac"></th>
-              <th data-i18n="col.vendor"></th>
-              <th data-i18n="col.rtt"></th>
-              <th data-i18n="col.services"></th>
-              <th data-i18n="col.http"></th>
-              <th data-i18n="col.workgroup"></th>
-              <th data-i18n="col.seenBy"></th>
-            </tr>
-          </thead>
-          <tbody id="rows"></tbody>
-        </table>
-      </main>
+      <div class="toolbar">
+        <input
+          id="filter"
+          type="search"
+          spellcheck="false"
+          autocomplete="off"
+          maxlength="200"
+          data-i18n-placeholder="filter.placeholder"
+          data-i18n-aria-label="filter.label"
+        />
+        <label class="checkbox">
+          <input id="only-online" type="checkbox" checked />
+          <span data-i18n="filter.onlineOnly"></span>
+        </label>
+        <span id="shown-count" class="muted"></span>
+      </div>
+      <div class="workspace">
+        <div id="table" tabindex="0" data-i18n-aria-label="table.label"></div>
+        <aside id="details" class="details"></aside>
+      </div>
     </div>
+
+    <div id="context-menu" class="menu" hidden></div>
+    <div id="toast" class="toast" role="status" hidden></div>
+
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <form id="settings-form" method="dialog" novalidate>
+        <h2 id="settings-title" data-i18n="settings.title"></h2>
+        <label class="field">
+          <span data-i18n="settings.theme"></span>
+          <select id="set-theme"></select>
+        </label>
+        <label class="field">
+          <span data-i18n="settings.language"></span>
+          <select id="set-language"></select>
+        </label>
+        <label class="field">
+          <span data-i18n="settings.concurrency"></span>
+          <input id="set-concurrency" type="number" min="1" max="256" step="1" required />
+          <small data-i18n="settings.concurrencyHint"></small>
+        </label>
+        <label class="field">
+          <span data-i18n="settings.timeout"></span>
+          <input id="set-timeout" type="number" min="100" max="10000" step="1" required />
+          <small data-i18n="settings.timeoutHint"></small>
+        </label>
+        <p id="settings-error" class="error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="settings-cancel" type="button" data-i18n="settings.cancel"></button>
+          <button type="submit" class="primary" data-i18n="settings.save"></button>
+        </div>
+      </form>
+    </dialog>
   </body>
 </html>

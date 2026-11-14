@@ -1,6 +1,10 @@
 //! Windows backend on top of the IP Helper API. Needs neither admin rights nor Npcap.
 
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use windows::Win32::Foundation::HANDLE;
@@ -11,8 +15,9 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKET_ADDRESS};
+use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 
-use super::{Adapter, Ipv4Net, NetBackend, NetError};
+use super::{Adapter, Ipv4Net, LaunchError, NetBackend, NetError};
 use crate::mac::MacAddr;
 
 const AF_INET: u16 = 2;
@@ -147,6 +152,48 @@ impl NetBackend for WindowsBackend {
             Ok(None)
         }
     }
+}
+
+/// `mstsc.exe /v:<ip>` from the system directory.
+pub fn open_remote_desktop(ip: IpAddr) -> Result<(), LaunchError> {
+    let IpAddr::V4(ip) = ip else {
+        return Err(LaunchError::Ipv6);
+    };
+    let program = os_dir(GetSystemDirectoryW)?.join("mstsc.exe");
+    launch(program, "mstsc.exe", format!("/v:{ip}"))
+}
+
+/// `explorer.exe \\<ip>` from the Windows directory.
+pub fn open_file_share(ip: IpAddr) -> Result<(), LaunchError> {
+    let IpAddr::V4(ip) = ip else {
+        return Err(LaunchError::Ipv6);
+    };
+    let program = os_dir(GetSystemWindowsDirectoryW)?.join("explorer.exe");
+    launch(program, "explorer.exe", format!(r"\\{ip}"))
+}
+
+/// Starts `program` (an absolute path, so no search path is involved) without waiting.
+/// The single argument is built from a validated address only.
+fn launch(program: PathBuf, name: &'static str, arg: String) -> Result<(), LaunchError> {
+    Command::new(program)
+        .arg(arg)
+        .spawn()
+        .map(drop)
+        .map_err(|source| LaunchError::Spawn {
+            program: name,
+            source,
+        })
+}
+
+/// Reads a directory from a `Get*DirectoryW` style API.
+fn os_dir(get: unsafe fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, LaunchError> {
+    let mut buf = [0u16; 512];
+    // SAFETY: the API writes at most `buf.len()` units and returns the length written.
+    let len = unsafe { get(Some(&mut buf)) } as usize;
+    if len == 0 || len >= buf.len() {
+        return Err(LaunchError::NoSystemDir);
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buf[..len])))
 }
 
 /// Closes the ICMP handle on drop.
@@ -330,6 +377,29 @@ mod tests {
             assert_eq!(wide_to_string(std::ptr::null()), "");
             assert_eq!(ansi_to_string(std::ptr::null()), "");
         }
+    }
+
+    #[test]
+    fn launch_targets_exist() {
+        assert!(
+            os_dir(GetSystemDirectoryW)
+                .unwrap()
+                .join("mstsc.exe")
+                .is_file()
+        );
+        assert!(
+            os_dir(GetSystemWindowsDirectoryW)
+                .unwrap()
+                .join("explorer.exe")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn launchers_reject_ipv6() {
+        let v6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        assert!(matches!(open_remote_desktop(v6), Err(LaunchError::Ipv6)));
+        assert!(matches!(open_file_share(v6), Err(LaunchError::Ipv6)));
     }
 
     // Smoke tests against the real OS; they only assert that the calls are sound.

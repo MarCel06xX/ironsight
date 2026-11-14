@@ -25,6 +25,39 @@ pub struct ScanConfig {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    #[error("concurrency must be between 1 and 256")]
+    Concurrency,
+    #[error("timeout must be between 100 and 10000 ms")]
+    Timeout,
+}
+
+impl ConfigError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Concurrency => "scan.invalid_concurrency",
+            Self::Timeout => "scan.invalid_timeout",
+        }
+    }
+}
+
+impl ScanConfig {
+    /// Validates user-supplied limits (see the `MIN_`/`MAX_` constants).
+    pub fn new(concurrency: u32, timeout_ms: u32) -> Result<Self, ConfigError> {
+        if !(1..=MAX_CONCURRENCY).contains(&concurrency) {
+            return Err(ConfigError::Concurrency);
+        }
+        if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(ConfigError::Timeout);
+        }
+        Ok(Self {
+            concurrency: concurrency as usize,
+            timeout: Duration::from_millis(u64::from(timeout_ms)),
+        })
+    }
+}
+
 /// Which discovery methods got an answer from a host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

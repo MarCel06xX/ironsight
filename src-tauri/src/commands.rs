@@ -1,22 +1,23 @@
 //! Tauri commands. All input from the webview is validated here before it reaches the engine.
 
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::watch;
 
+use crate::actions;
 use crate::enrich::NetEnricher;
 use crate::error::CommandError;
-use crate::platform::{Adapter, NetBackend};
+use crate::mac::MacAddr;
+use crate::platform::{self, Adapter, NetBackend};
 use crate::scan::engine::run_scan;
 use crate::scan::range::TargetSet;
-use crate::scan::{
-    DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, MAX_CONCURRENCY, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS,
-    ScanConfig,
-};
+use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, ScanConfig};
+use crate::settings::{self, Settings};
 
 pub const EVENT_SCAN_BATCH: &str = "scan:batch";
 pub const EVENT_SCAN_FINISHED: &str = "scan:finished";
@@ -92,23 +93,16 @@ pub struct ScanStarted {
 
 fn scan_config(request: &ScanRequest) -> Result<ScanConfig, CommandError> {
     let concurrency = request.concurrency.unwrap_or(DEFAULT_CONCURRENCY);
-    if !(1..=MAX_CONCURRENCY).contains(&concurrency) {
-        return Err(CommandError::new(
-            "scan.invalid_concurrency",
-            format!("concurrency must be between 1 and {MAX_CONCURRENCY}"),
-        ));
-    }
     let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
-        return Err(CommandError::new(
-            "scan.invalid_timeout",
-            format!("timeout must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS} ms"),
-        ));
-    }
-    Ok(ScanConfig {
-        concurrency: concurrency as usize,
-        timeout: Duration::from_millis(u64::from(timeout_ms)),
-    })
+    Ok(ScanConfig::new(concurrency, timeout_ms)?)
+}
+
+fn internal(error: impl std::fmt::Display) -> CommandError {
+    CommandError::new("internal", error.to_string())
+}
+
+fn io_error(code: &'static str, error: impl std::fmt::Display) -> CommandError {
+    CommandError::new(code, error.to_string()).with_detail(error.to_string())
 }
 
 #[tauri::command]
@@ -116,7 +110,7 @@ pub async fn list_adapters(state: State<'_, AppState>) -> Result<Vec<Adapter>, C
     let backend = Arc::clone(&state.backend);
     tauri::async_runtime::spawn_blocking(move || backend.list_adapters())
         .await
-        .map_err(|e| CommandError::new("internal", e.to_string()))?
+        .map_err(internal)?
         .map_err(CommandError::from)
 }
 
@@ -163,8 +157,91 @@ pub fn stop_scan(state: State<'_, AppState>) {
     state.cancel_scan();
 }
 
+fn settings_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| io_error("settings.io", e))?;
+    Ok(dir.join(settings::FILE_NAME))
+}
+
+/// Saved settings; defaults if there are none or the file is unreadable.
+#[tauri::command]
+pub async fn load_settings(app: AppHandle) -> Settings {
+    match settings_path(&app) {
+        Ok(path) => tauri::async_runtime::spawn_blocking(move || Settings::load(&path))
+            .await
+            .unwrap_or_default(),
+        Err(_) => Settings::default(),
+    }
+}
+
+#[tauri::command]
+pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
+    settings.validate()?;
+    let path = settings_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || settings.save(&path))
+        .await
+        .map_err(internal)?
+        .map_err(|e| io_error("settings.io", e))
+}
+
+/// Opens `http(s)://<ip>:<port>/` in the default browser. The URL is built from typed
+/// values only, never from a string supplied by the webview.
+#[tauri::command]
+pub async fn open_in_browser(ip: IpAddr, secure: bool, port: u16) -> Result<(), CommandError> {
+    if port == 0 {
+        return Err(CommandError::new(
+            "action.invalid_port",
+            "port must not be 0",
+        ));
+    }
+    tauri_plugin_opener::open_url(actions::web_url(ip, secure, port), None::<&str>)
+        .map_err(|e| io_error("action.open_failed", e))
+}
+
+#[tauri::command]
+pub async fn open_remote_desktop(ip: IpAddr) -> Result<(), CommandError> {
+    Ok(platform::open_remote_desktop(ip)?)
+}
+
+#[tauri::command]
+pub async fn open_file_share(ip: IpAddr) -> Result<(), CommandError> {
+    Ok(platform::open_file_share(ip)?)
+}
+
+/// Sends a Wake-on-LAN magic packet for `mac`; `ip` (the last known address) selects the
+/// subnet to broadcast on.
+#[tauri::command]
+pub async fn wake_on_lan(
+    state: State<'_, AppState>,
+    mac: String,
+    ip: Option<IpAddr>,
+) -> Result<(), CommandError> {
+    let mac = mac
+        .parse::<MacAddr>()
+        .ok()
+        .filter(|mac| actions::is_wakeable(*mac))
+        .ok_or_else(|| CommandError::new("action.invalid_mac", "invalid MAC address"))?;
+    let target = match ip {
+        Some(IpAddr::V4(v4)) => Some(v4),
+        _ => None,
+    };
+    let backend = Arc::clone(&state.backend);
+    tauri::async_runtime::spawn_blocking(move || {
+        let adapters = backend.list_adapters().unwrap_or_default();
+        actions::send_magic_packet(mac, target, &adapters)
+    })
+    .await
+    .map_err(internal)?
+    .map(drop)
+    .map_err(|e| io_error("action.wol_failed", e))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::platform::default_backend;
 

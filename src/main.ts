@@ -1,18 +1,59 @@
-// Phase 1 UI: just enough to drive and verify the backend. The real table (virtual
-// scrolling, sorting, filter, details) replaces the simple one below in phase 3.
+// Ironsight frontend entry: wires scan controls, results table, details panel, context
+// menu and settings together. Scan results live in memory only.
 import {
   type HostResult,
-  type NameSource,
   type ScanBatch,
   type ScanSummary,
+  type Settings,
   isCommandError,
   listAdapters,
+  loadSettings,
   onScanBatch,
   onScanFinished,
+  openFileShare,
+  openInBrowser,
+  openRemoteDesktop,
   startScan,
   stopScan,
+  wakeOnLan,
 } from "./api";
-import { type MessageKey, applyTranslations, t } from "./i18n";
+import { renderDetails } from "./details";
+import {
+  hostnameText,
+  rttText,
+  servicesText,
+  statusKey,
+  vendorText,
+  webPort,
+  webText,
+} from "./format";
+import {
+  type Language,
+  type MessageKey,
+  applyTranslations,
+  detectLanguage,
+  formatNumber,
+  isMessageKey,
+  onLanguageChange,
+  setLanguage,
+  t,
+} from "./i18n";
+import { ContextMenu, type MenuItem } from "./menu";
+import { SettingsDialog } from "./settings";
+import { HostStore, type SortKey } from "./store";
+import { type Column, VirtualTable } from "./table";
+import { applyTheme } from "./theme";
+import { Toast } from "./toast";
+
+const DEFAULT_SETTINGS: Settings = {
+  theme: "dark",
+  language: "system",
+  concurrency: 64,
+  timeoutMs: 1000,
+};
+/** Minimum time between table refreshes while results stream in. */
+const REFRESH_INTERVAL_MS = 200;
+const FILTER_DELAY_MS = 120;
 
 function byId<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -25,161 +66,315 @@ const targetInput = byId<HTMLInputElement>("targets");
 const scanButton = byId<HTMLButtonElement>("scan-btn");
 const progressBar = byId<HTMLProgressElement>("progress");
 const progressText = byId<HTMLSpanElement>("progress-text");
+const settingsButton = byId<HTMLButtonElement>("settings-btn");
 const errorBox = byId<HTMLParagraphElement>("error");
-const rows = byId<HTMLTableSectionElement>("rows");
+const filterInput = byId<HTMLInputElement>("filter");
+const onlineOnlyBox = byId<HTMLInputElement>("only-online");
+const shownCount = byId<HTMLSpanElement>("shown-count");
+const detailsPanel = byId<HTMLElement>("details");
 
-let running = false;
-/** Numeric IPs of the rendered rows, ascending and parallel to `rows.children`. */
-let rowKeys: number[] = [];
-const rowByIp = new Map<string, HTMLTableRowElement>();
+type ScanStatus = "ready" | "running" | "done" | "stopped";
+
+const store = new HostStore();
+const toast = new Toast(byId("toast"));
+const menu = new ContextMenu(byId("context-menu"));
 /** IPv4 addresses of this machine, to label its own row. */
 const ownAddresses = new Set<string>();
+const progress = { scanned: 0, total: 0, online: 0, status: "ready" as ScanStatus };
 
-function ipToNumber(ip: string): number {
-  return ip.split(".").reduce((acc, octet) => acc * 256 + Number(octet), 0);
+let settings: Settings = DEFAULT_SETTINGS;
+let running = false;
+let stopping = false;
+/** Batches of scans up to this id are stale and ignored. */
+let lastFinishedScanId = 0;
+let selectedIp: string | null = null;
+let detailsHost: HostResult | undefined;
+let lastError: unknown = null;
+let noAdapters = false;
+let refreshTimer = 0;
+let lastRefresh = 0;
+let filterTimer = 0;
+
+// --- table ---------------------------------------------------------------------------
+
+function textColumn(key: SortKey, label: MessageKey, text: (host: HostResult) => string): Column {
+  return {
+    key,
+    label,
+    render: (cell, host) => {
+      cell.textContent = text(host);
+    },
+  };
+}
+
+const columns: Column[] = [
+  {
+    key: "status",
+    label: "col.status",
+    render: (cell, host) => {
+      const dot = document.createElement("span");
+      dot.className = `dot ${!host.online ? "offline" : host.complete ? "online" : "pending"}`;
+      cell.append(dot, document.createTextNode(t(statusKey(host))));
+    },
+  },
+  textColumn("ip", "col.ip", (host) => host.ip),
+  textColumn("hostname", "col.hostname", hostnameText),
+  textColumn("mac", "col.mac", (host) => host.mac ?? ""),
+  textColumn("vendor", "col.vendor", vendorText),
+  textColumn("rtt", "col.rtt", rttText),
+  textColumn("services", "col.services", servicesText),
+  textColumn("web", "col.web", (host) => webText(host) ?? ""),
+  textColumn("workgroup", "col.workgroup", (host) => host.workgroup ?? ""),
+];
+
+const table = new VirtualTable(byId("table"), columns, {
+  select: selectHost,
+  contextMenu: openHostMenu,
+  sort: (key) => {
+    store.setSort(key);
+    table.setSort(store.sortKey, store.ascending);
+    refreshView();
+  },
+});
+
+function emptyText(): string {
+  if (store.total > 0) return t("table.noMatches");
+  return running ? t("table.scanning") : t("table.empty");
+}
+
+function refreshView(): void {
+  window.clearTimeout(refreshTimer);
+  refreshTimer = 0;
+  lastRefresh = performance.now();
+  const rows = store.rows();
+  table.setRows(rows, emptyText());
+  shownCount.textContent = t("filter.count", {
+    shown: formatNumber(rows.length),
+    total: formatNumber(store.total),
+  });
+  updateDetails(false);
+}
+
+/** Coalesces refreshes while batches stream in (sorting 65k rows is not free). */
+function scheduleRefresh(): void {
+  if (refreshTimer !== 0) return;
+  const wait = Math.max(0, lastRefresh + REFRESH_INTERVAL_MS - performance.now());
+  refreshTimer = window.setTimeout(refreshView, wait);
+}
+
+function selectHost(ip: string | null): void {
+  selectedIp = ip;
+  table.setSelected(ip);
+  updateDetails(true);
+}
+
+/** Re-renders the panel when the selected host changed or got new data. */
+function updateDetails(force: boolean): void {
+  const host = selectedIp === null ? undefined : store.get(selectedIp);
+  if (!force && host === detailsHost) return;
+  detailsHost = host;
+  renderDetails(detailsPanel, host, host !== undefined && ownAddresses.has(host.ip));
+}
+
+// --- errors and feedback ---------------------------------------------------------------
+
+function formatDetail(detail: string | null): string {
+  if (detail === null) return "";
+  return /^\d+$/.test(detail) ? formatNumber(Number(detail)) : detail;
+}
+
+/** Localized text for a backend error, falling back to its English message. */
+function errorText(error: unknown): string {
+  if (isCommandError(error)) {
+    const key = `error.${error.code}`;
+    if (isMessageKey(key)) return t(key, { detail: formatDetail(error.detail ?? null) });
+    return error.message;
+  }
+  return String(error);
 }
 
 function showError(error: unknown): void {
-  // Backend messages are English for now; `code` gets localized in phase 3.
-  errorBox.textContent = isCommandError(error) ? error.message : String(error);
-  errorBox.hidden = false;
+  lastError = error;
+  renderError();
+}
+
+function renderError(): void {
+  errorBox.hidden = lastError === null;
+  errorBox.textContent = lastError === null ? "" : errorText(lastError);
+}
+
+async function runAction(action: () => Promise<void>, success?: () => string): Promise<void> {
+  try {
+    await action();
+    if (success) toast.show(success());
+  } catch (error) {
+    toast.show(errorText(error), "error");
+  }
+}
+
+/** Fallback for webviews without the async clipboard API. */
+function legacyCopy(text: string): boolean {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.readOnly = true;
+  area.className = "offscreen";
+  document.body.append(area);
+  area.select();
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    area.remove();
+  }
+}
+
+async function copyText(text: string): Promise<void> {
+  let copied: boolean;
+  try {
+    await navigator.clipboard.writeText(text);
+    copied = true;
+  } catch {
+    copied = legacyCopy(text);
+  }
+  if (copied) toast.show(t("toast.copied", { value: text }));
+  else toast.show(t("toast.copyFailed"), "error");
+}
+
+// --- context menu ------------------------------------------------------------------------
+
+function openHostMenu(ip: string, x: number, y: number): void {
+  const host = store.get(ip);
+  if (!host) return;
+  const mac = host.mac;
+  const items: MenuItem[] = [
+    { label: t("menu.copyIp"), run: () => copyText(host.ip) },
+    { label: t("menu.copyMac"), disabled: mac === null, run: () => copyText(mac ?? "") },
+    {
+      label: t("menu.openHttp"),
+      separatorBefore: true,
+      run: () => runAction(() => openInBrowser(ip, false, webPort(host, false))),
+    },
+    {
+      label: t("menu.openHttps"),
+      run: () => runAction(() => openInBrowser(ip, true, webPort(host, true))),
+    },
+    { label: t("menu.rdp"), run: () => runAction(() => openRemoteDesktop(ip)) },
+    { label: t("menu.share"), run: () => runAction(() => openFileShare(ip)) },
+    {
+      label: t("menu.wol"),
+      separatorBefore: true,
+      disabled: mac === null,
+      run: () =>
+        runAction(
+          () => wakeOnLan(mac ?? "", ip),
+          () => t("toast.wolSent", { mac: mac ?? "" }),
+        ),
+    },
+  ];
+  menu.open(items, x, y, t("menu.label"));
+}
+
+// --- scanning ------------------------------------------------------------------------------
+
+function renderScanButton(): void {
+  scanButton.textContent = t(running ? "scan.stop" : "scan.start");
+  scanButton.disabled = stopping;
 }
 
 function setRunning(value: boolean): void {
   running = value;
-  scanButton.textContent = t(value ? "scan.stop" : "scan.start");
-  scanButton.disabled = false;
+  stopping = false;
   targetInput.disabled = value;
   adapterSelect.disabled = value;
+  renderScanButton();
 }
 
-function setProgress(scanned: number, total: number, online: number, status?: MessageKey): void {
+function renderProgress(): void {
+  const { scanned, total, online, status } = progress;
   progressBar.max = Math.max(total, 1);
   progressBar.value = scanned;
-  const counts = t("scan.progress", { scanned, total, online });
-  progressText.textContent = status ? `${t(status)} – ${counts}` : counts;
-}
-
-function addCell(row: HTMLTableRowElement, text: string): void {
-  // textContent only: everything shown here ultimately comes from the network.
-  const cell = row.insertCell();
-  cell.textContent = text;
-  cell.title = text; // full value for truncated cells (plain text, not HTML)
-}
-
-const SOURCE_KEYS: Record<NameSource, MessageKey> = {
-  dns: "source.dns",
-  mdns: "source.mdns",
-  netbios: "source.netbios",
-};
-
-function hostnameText(host: HostResult): string {
-  if (host.hostname !== null && host.hostnameSource !== null) {
-    const source = t(SOURCE_KEYS[host.hostnameSource]);
-    return t("host.nameWithSource", { name: host.hostname, source });
-  }
-  return host.complete ? "" : t("host.pending");
-}
-
-function vendorText(host: HostResult): string {
-  if (host.macLocal) return t("vendor.local");
-  return host.vendor ?? "";
-}
-
-/** First HTTP title, otherwise the first `Server` header. */
-function httpText(host: HostResult): string {
-  const infos = host.services.flatMap((service) => (service.http ? [service.http] : []));
-  const title = infos.find((info) => info.title !== null)?.title;
-  return title ?? infos.find((info) => info.server !== null)?.server ?? "";
-}
-
-function renderRow(row: HTMLTableRowElement, host: HostResult): void {
-  row.replaceChildren();
-  row.classList.toggle("pending", !host.complete);
-  const via: string[] = [];
-  if (ownAddresses.has(host.ip)) via.push(t("seenBy.self"));
-  if (host.seenBy.arp) via.push(t("seenBy.arp"));
-  if (host.seenBy.icmp) via.push(t("seenBy.icmp"));
-  if (host.seenBy.tcp) via.push(t("seenBy.tcp"));
-  let rtt = "";
-  if (host.rttMs !== null) {
-    rtt = host.rttMs === 0 ? t("rtt.subMs") : t("rtt.ms", { ms: host.rttMs });
-  }
-  addCell(row, host.ip);
-  addCell(row, hostnameText(host));
-  addCell(row, host.mac ?? "");
-  addCell(row, vendorText(host));
-  addCell(row, rtt);
-  addCell(row, host.services.map((service) => `${service.port} ${service.name}`).join(", "));
-  addCell(row, httpText(host));
-  addCell(row, host.workgroup ?? "");
-  addCell(row, via.join(", "));
-}
-
-/** Inserts or updates an online host, keeping rows sorted by numeric IP. */
-function upsertHost(host: HostResult): void {
-  const existing = rowByIp.get(host.ip);
-  if (existing) {
-    renderRow(existing, host);
+  if (status === "ready") {
+    progressText.textContent = t("scan.status.ready");
     return;
   }
-  const key = ipToNumber(host.ip);
-  let lo = 0;
-  let hi = rowKeys.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if ((rowKeys[mid] ?? Infinity) < key) lo = mid + 1;
-    else hi = mid;
-  }
-  const row = document.createElement("tr");
-  renderRow(row, host);
-  rows.insertBefore(row, rows.children[lo] ?? null);
-  rowKeys.splice(lo, 0, key);
-  rowByIp.set(host.ip, row);
-}
-
-function clearResults(): void {
-  rows.replaceChildren();
-  rowKeys = [];
-  rowByIp.clear();
-}
-
-function handleBatch(batch: ScanBatch): void {
-  for (const host of batch.hosts) {
-    if (host.online) upsertHost(host);
-  }
-  setProgress(batch.scanned, batch.total, batch.online);
-}
-
-function handleFinished(summary: ScanSummary): void {
-  setRunning(false);
-  setProgress(
-    summary.scanned,
-    summary.total,
-    summary.online,
-    summary.cancelled ? "scan.status.stopped" : "scan.status.done",
-  );
+  const counts = t("scan.progress", {
+    scanned: formatNumber(scanned),
+    total: formatNumber(total),
+    online: formatNumber(online),
+  });
+  const prefix: Record<ScanStatus, MessageKey | null> = {
+    ready: null,
+    running: null,
+    done: "scan.status.done",
+    stopped: "scan.status.stopped",
+  };
+  const key = prefix[status];
+  progressText.textContent = key ? `${t(key)} – ${counts}` : counts;
 }
 
 async function toggleScan(): Promise<void> {
-  errorBox.hidden = true;
+  lastError = null;
+  renderError();
   if (running) {
-    scanButton.disabled = true; // re-enabled by the `scan:finished` event
+    stopping = true; // the button comes back with `scan:finished`
+    renderScanButton();
     await stopScan().catch(showError);
     return;
   }
-  clearResults();
+  store.clear();
+  selectHost(null);
+  Object.assign(progress, { scanned: 0, total: 0, online: 0, status: "running" });
   setRunning(true);
-  progressBar.value = 0;
-  progressText.textContent = "";
+  renderProgress();
+  refreshView();
   try {
-    const started = await startScan({ targets: targetInput.value });
+    const started = await startScan({
+      targets: targetInput.value,
+      concurrency: settings.concurrency,
+      timeoutMs: settings.timeoutMs,
+    });
     // Batches may already have arrived; only fill in the total if none did.
-    if (progressBar.value === 0) setProgress(0, started.total, 0);
+    if (progress.total === 0) {
+      progress.total = started.total;
+      renderProgress();
+    }
   } catch (error) {
     setRunning(false);
+    progress.status = "ready";
+    renderProgress();
+    refreshView();
     showError(error);
   }
+}
+
+function handleBatch(batch: ScanBatch): void {
+  if (batch.scanId <= lastFinishedScanId) return;
+  store.upsert(batch.hosts);
+  Object.assign(progress, { scanned: batch.scanned, total: batch.total, online: batch.online });
+  renderProgress();
+  scheduleRefresh();
+}
+
+function handleFinished(summary: ScanSummary): void {
+  lastFinishedScanId = Math.max(lastFinishedScanId, summary.scanId);
+  store.completeAll();
+  Object.assign(progress, {
+    scanned: summary.scanned,
+    total: summary.total,
+    online: summary.online,
+    status: summary.cancelled ? "stopped" : "done",
+  });
+  setRunning(false);
+  renderProgress();
+  refreshView();
+}
+
+// --- adapters, settings, language --------------------------------------------------------
+
+function renderAdapterPlaceholder(): void {
+  const option = adapterSelect.options[0];
+  if (noAdapters && option) option.textContent = t("adapter.none");
 }
 
 async function loadAdapters(): Promise<void> {
@@ -195,20 +390,41 @@ async function loadAdapters(): Promise<void> {
       adapterSelect.append(option);
     }
   }
-  if (adapterSelect.options.length === 0) {
+  noAdapters = adapterSelect.options.length === 0;
+  if (noAdapters) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = t("adapter.none");
     adapterSelect.append(option);
+    renderAdapterPlaceholder();
   }
   if (targetInput.value === "") targetInput.value = adapterSelect.value;
 }
 
-async function init(): Promise<void> {
-  applyTranslations(document);
-  setRunning(false);
-  progressText.textContent = t("scan.status.ready");
+function resolveLanguage(setting: Settings["language"]): Language {
+  return setting === "system" ? detectLanguage(navigator.language) : setting;
+}
 
+function applySettings(next: Settings): void {
+  settings = next;
+  applyTheme(next.theme);
+  setLanguage(resolveLanguage(next.language));
+}
+
+onLanguageChange(() => {
+  menu.close(false);
+  store.refreshLocale();
+  table.invalidate();
+  renderScanButton();
+  renderProgress();
+  renderError();
+  renderAdapterPlaceholder();
+  refreshView();
+  updateDetails(true);
+});
+
+const settingsDialog = new SettingsDialog(byId("settings-dialog"), applySettings, errorText);
+
+function wireEvents(): void {
   adapterSelect.addEventListener("change", () => {
     if (adapterSelect.value !== "") targetInput.value = adapterSelect.value;
   });
@@ -216,6 +432,44 @@ async function init(): Promise<void> {
   targetInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !running) void toggleScan();
   });
+  settingsButton.addEventListener("click", () => settingsDialog.open(settings));
+  filterInput.addEventListener("input", () => {
+    window.clearTimeout(filterTimer);
+    filterTimer = window.setTimeout(() => {
+      store.setFilter(filterInput.value);
+      refreshView();
+    }, FILTER_DELAY_MS);
+  });
+  onlineOnlyBox.addEventListener("change", () => {
+    store.setOnlineOnly(onlineOnlyBox.checked);
+    refreshView();
+  });
+  // No browser context menu outside text fields; Ctrl+F jumps to the filter.
+  document.addEventListener("contextmenu", (event) => {
+    if (!(event.target instanceof Element && event.target.closest("input, textarea"))) {
+      event.preventDefault();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      filterInput.focus();
+      filterInput.select();
+    }
+  });
+}
+
+async function init(): Promise<void> {
+  settings = await loadSettings().catch(() => DEFAULT_SETTINGS);
+  applyTheme(settings.theme);
+  setLanguage(resolveLanguage(settings.language));
+  applyTranslations(document);
+  setRunning(false);
+  renderProgress();
+  table.setSort(store.sortKey, store.ascending);
+  refreshView();
+  updateDetails(true);
+  wireEvents();
 
   await onScanBatch(handleBatch);
   await onScanFinished(handleFinished);

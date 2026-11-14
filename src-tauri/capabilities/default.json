@@ -2,12 +2,20 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Main window: listen to scan events and call the app's own commands. Inputs are validated in Rust.",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "allow-list-adapters",
     "allow-start-scan",
-    "allow-stop-scan"
+    "allow-stop-scan",
+    "allow-load-settings",
+    "allow-save-settings",
+    "allow-open-in-browser",
+    "allow-open-remote-desktop",
+    "allow-open-file-share",
+    "allow-wake-on-lan"
   ]
 }

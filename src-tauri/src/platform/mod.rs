@@ -45,6 +45,12 @@ impl Ipv4Net {
         }
     }
 
+    /// Directed broadcast address of the subnet; `None` for /31 and /32.
+    pub fn broadcast(&self) -> Option<Ipv4Addr> {
+        let host_bits = !mask(self.prefix_len);
+        (self.prefix_len <= 30).then(|| Ipv4Addr::from(u32::from(self.addr) | host_bits))
+    }
+
     /// Whether `ip` is on-link, i.e. reachable via ARP from this address.
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         let mask = mask(self.prefix_len);
@@ -92,6 +98,39 @@ pub trait NetBackend: Send + Sync + 'static {
     fn icmp_ping(&self, target: IpAddr, timeout: Duration) -> Result<Option<Duration>, NetError>;
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchError {
+    #[error("IPv6 targets are not supported yet")]
+    Ipv6,
+    #[error("could not start {program}: {source}")]
+    Spawn {
+        program: &'static str,
+        source: std::io::Error,
+    },
+    #[error("system directory not found")]
+    NoSystemDir,
+    /// Only constructed by the placeholder backend of other platforms.
+    #[cfg_attr(windows, allow(dead_code))]
+    #[error("not supported on this platform")]
+    Unsupported,
+}
+
+/// Starts the Remote Desktop client for `ip`.
+pub fn open_remote_desktop(ip: IpAddr) -> Result<(), LaunchError> {
+    #[cfg(windows)]
+    return windows::open_remote_desktop(ip);
+    #[cfg(not(windows))]
+    return unsupported::open_remote_desktop(ip);
+}
+
+/// Shows the file shares of `ip` in the file manager.
+pub fn open_file_share(ip: IpAddr) -> Result<(), LaunchError> {
+    #[cfg(windows)]
+    return windows::open_file_share(ip);
+    #[cfg(not(windows))]
+    return unsupported::open_file_share(ip);
+}
+
 pub fn default_backend() -> Arc<dyn NetBackend> {
     #[cfg(windows)]
     return Arc::new(windows::WindowsBackend);
@@ -118,6 +157,26 @@ mod tests {
         let net = Ipv4Net::new(Ipv4Addr::new(10, 1, 2, 3), 8);
         assert_eq!(net.scan_target, "10.1.2.0/24");
         assert_eq!(net.prefix_len, 8);
+    }
+
+    #[test]
+    fn broadcast_addresses() {
+        let broadcast =
+            |addr: [u8; 4], prefix| Ipv4Net::new(Ipv4Addr::from(addr), prefix).broadcast();
+        assert_eq!(
+            broadcast([192, 168, 1, 23], 24),
+            Some(Ipv4Addr::new(192, 168, 1, 255))
+        );
+        assert_eq!(
+            broadcast([172, 20, 99, 5], 20),
+            Some(Ipv4Addr::new(172, 20, 111, 255))
+        );
+        assert_eq!(
+            broadcast([10, 0, 0, 4], 30),
+            Some(Ipv4Addr::new(10, 0, 0, 7))
+        );
+        assert_eq!(broadcast([10, 0, 0, 4], 31), None);
+        assert_eq!(broadcast([10, 0, 0, 4], 32), None);
     }
 
     #[test]

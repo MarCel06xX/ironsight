@@ -6,10 +6,11 @@ Windows only. Port scanning / packet capture / Linux come later – keep platfor
 
 ## Current phase
 
-**Phase 2 done** (enrichment: DNS PTR, mDNS, NetBIOS NBSTAT, OUI vendor, TCP service probes,
-HTTP Server/title; extra columns in the provisional table).
-Next: **Phase 3** - UI: virtual table, sort/filter, details panel, context menu (copy, browser,
-RDP, Explorer, WoL), settings dialog, 5 themes, i18n switch, localized backend error codes.
+**Phase 3 done** (virtual table, sort/filter, details panel, context menu with copy/browser/
+RDP/Explorer/WoL, settings dialog + persistence, 5 themes, runtime i18n, localized errors).
+Next: **Phase 4** - export: CSV (UTF-8 BOM, `;` default or `,`), JSON (`schema_version`, scan
+metadata, all name sources/services), self-contained printable HTML report (escape everything);
+all rows or current filtered view; via `tauri-plugin-dialog` save dialog.
 
 Phases: 0 scaffold · 1 backend core · 2 enrichment · 3 UI · 4 export · 5 polish/release.
 After each phase: fmt + clippy + tests, commit, push, short summary, **wait for the user's OK**.
@@ -38,9 +39,12 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
 - `withGlobalTauri: false`; strict CSP in `tauri.conf.json` (`devCsp` relaxed only for Vite HMR).
   No inline styles/scripts – themes via `<html data-theme>` + CSS custom properties.
 - Capability `default`: only `core:event:allow-listen/unlisten` plus the app's own commands. No
-  shell plugin. Opener/dialog
-  plugins get added (Rust side) in phases 3/4 and are called from Rust, not exposed to the webview
-  unless needed.
+  shell plugin. `tauri-plugin-opener` is used only through its free function
+  `tauri_plugin_opener::open_url` from Rust - the plugin is *not* registered, so the webview has
+  no opener API at all. Do the same with the dialog plugin if possible (phase 4).
+- Settings (`settings.rs`): `%APPDATA%\io.github.marcel06xx.ironsight\settings.json`, `{theme,
+  language, concurrency, timeoutMs}`; missing/corrupt file -> defaults, out-of-range numbers reset
+  per field, atomic write via `.tmp` + rename, 64 KiB read limit. Validated again on save.
 - Lib crate has no mobile crate-types (desktop only). Bundle target: NSIS only.
 - Data types use `IpAddr` (IPv4 only in v1, IPv6 not blocked by design).
 - Online = ARP answers OR ICMP answers OR any TCP probe connects.
@@ -63,18 +67,36 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
   `enrich::NetEnricher` (DNS servers per adapter from `GetAdaptersAddresses`).
 - Events: `scan:batch` (`ScanBatch`: host upserts keyed by IP + totals, flushed every 100 ms or 512
   hosts; offline hosts are sent too; online hosts come again with `complete: true`) and `scan:finished` (`ScanSummary`). One scan at a time.
-- IPC JSON is camelCase. Command errors are `{ code, message }`; `code` is meant for i18n
-  (frontend still shows the English `message` - localize in phase 3).
+- IPC JSON is camelCase. Command errors are `{ code, message, detail }`; the frontend shows
+  `error.<code>` from the locale files with `{detail}` filled in, falling back to `message`.
+  New error codes need an `error.*` key in both locale files.
+- Host actions (`actions.rs`, `platform::open_*`): browser URL built from `IpAddr` + bool + `u16`;
+  `mstsc.exe /v:<ip>` and `explorer.exe \\<ip>` started by absolute path from
+  `GetSystemDirectoryW` / `GetSystemWindowsDirectoryW` (no PATH search, IPv4 only for now);
+  WoL magic packet = 6x FF + 16x MAC to UDP 9, directed + limited broadcast from the adapter of
+  the host's subnet (all adapters if unknown/off-link; plus unicast if off-link).
 - App commands are listed in `build.rs` (`AppManifest::commands`) and must also be allowed in
   `capabilities/default.json` (`allow-<command-name>`). Add new commands in both places plus
   `generate_handler!`.
 - Limits: concurrency 1-256 (default 64), timeout 100-10,000 ms (default 1000).
 
-## Frontend (phase 1, provisional)
+## Frontend (`src/`)
 
-`src/api.ts` typed invoke/listen wrappers · `src/i18n.ts` + `src/locales/{en,de}.json` (flat keys,
-`data-i18n*` attributes, `de` is type-checked against `en`) · `src/main.ts` simple online-only table,
-to be replaced by the virtual table in phase 3.
+- `api.ts` typed invoke/listen wrappers + IPC types · `main.ts` wiring (scan flow, menu actions,
+  error/toast, settings, language listener).
+- `store.ts` `HostStore`: Map ip -> host + precomputed search text/IP key; `rows()` = filtered +
+  sorted view, cached until a change. Empty values sort last in both directions. 65,536 hosts:
+  3-52 ms per re-sort (Node bench); refreshes are coalesced to >= 200 ms while scanning.
+- `table.ts` `VirtualTable`: sticky header + absolutely positioned pooled rows (`translateY`,
+  slot = row index % pool size), fixed `ROW_HEIGHT` 28 px = CSS `--row-height`; grid columns via
+  `--vt-columns`. Keyboard: arrows/Page/Home/End, context-menu key / Shift+F10.
+- `details.ts` panel, `menu.ts` context menu, `toast.ts`, `settings.ts` dialog (theme preview,
+  revert on cancel), `theme.ts` (5 themes = `[data-theme]` blocks in `styles.css`, colors only),
+  `format.ts` display helpers.
+- `i18n.ts`: flat keys, `data-i18n`, `-placeholder`, `-title`, `-aria-label`; `de` type-checked
+  against `en`; `setLanguage` + `onLanguageChange` for runtime switching; `Intl` number/date formats.
+- CSS changes go through CSSOM (`el.style.x = ...`), never `style` attributes (CSP).
+- Browser context menu is suppressed outside inputs; Ctrl+F focuses the filter.
 
 ## Enrichment (phase 2, `src-tauri/src/enrich/`)
 

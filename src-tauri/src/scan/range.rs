@@ -48,6 +48,20 @@ impl RangeError {
             Self::TooManyHosts { .. } => "range.too_many_hosts",
         }
     }
+
+    /// The value the message refers to, for localized messages.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::Empty | Self::InputTooLong => None,
+            Self::InvalidAddress(s)
+            | Self::InvalidRange(s)
+            | Self::ReversedRange(s)
+            | Self::InvalidPrefix(s)
+            | Self::NotUnicast(s) => Some(s.clone()),
+            Self::PrefixTooLarge { prefix } => Some(prefix.to_string()),
+            Self::TooManyHosts { count } => Some(count.to_string()),
+        }
+    }
 }
 
 /// Deduplicated, ascending set of IPv4 scan targets (at most [`MAX_HOSTS`]).

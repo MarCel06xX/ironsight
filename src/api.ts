@@ -15,6 +15,7 @@ export interface Adapter {
   description: string;
   mac: string | null;
   ipv4: Ipv4Net[];
+  dnsServers: string[];
   hasGateway: boolean;
 }
 
@@ -36,7 +37,7 @@ export interface ServiceInfo {
 /**
  * One scanned address. Arrives once after probing and, for online hosts, again with
  * `complete = true` after enrichment: always upsert by `ip`.
- * All strings except `ip`, `mac` and `name` are untrusted network data: `textContent` only.
+ * Names, vendor, workgroup and HTTP fields are untrusted network data: `textContent` only.
  */
 export interface HostResult {
   ip: string;
@@ -88,10 +89,22 @@ export interface ScanStarted {
   total: number;
 }
 
-/** Error shape of all backend commands. */
+export type ThemeName = "dark" | "light" | "blue" | "terminal" | "purple";
+export type LanguageSetting = "system" | "en" | "de";
+
+/** The only data that is persisted (settings.json in the app config directory). */
+export interface Settings {
+  theme: ThemeName;
+  language: LanguageSetting;
+  concurrency: number;
+  timeoutMs: number;
+}
+
+/** Error shape of all backend commands; `code` maps to the `error.<code>` message. */
 export interface CommandError {
   code: string;
   message: string;
+  detail: string | null;
 }
 
 export function isCommandError(value: unknown): value is CommandError {
@@ -106,6 +119,22 @@ export const startScan = (request: ScanRequest): Promise<ScanStarted> =>
   invoke("start_scan", { request });
 
 export const stopScan = (): Promise<void> => invoke("stop_scan");
+
+export const loadSettings = (): Promise<Settings> => invoke("load_settings");
+
+export const saveSettings = (settings: Settings): Promise<void> =>
+  invoke("save_settings", { settings });
+
+export const openInBrowser = (ip: string, secure: boolean, port: number): Promise<void> =>
+  invoke("open_in_browser", { ip, secure, port });
+
+export const openRemoteDesktop = (ip: string): Promise<void> =>
+  invoke("open_remote_desktop", { ip });
+
+export const openFileShare = (ip: string): Promise<void> => invoke("open_file_share", { ip });
+
+export const wakeOnLan = (mac: string, ip: string | null): Promise<void> =>
+  invoke("wake_on_lan", { mac, ip });
 
 export const onScanBatch = (handler: (batch: ScanBatch) => void): Promise<UnlistenFn> =>
   listen<ScanBatch>("scan:batch", (event) => handler(event.payload));
