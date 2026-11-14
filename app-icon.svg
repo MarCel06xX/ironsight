@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Ironsight app icon: a sight with a found host in the center.
+       Regenerate the icon set with: npx tauri icon app-icon.svg -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f3360" />
+      <stop offset="1" stop-color="#0a1428" />
+    </linearGradient>
+  </defs>
+  <rect x="40" y="40" width="944" height="944" rx="210" fill="url(#bg)" />
+  <circle cx="512" cy="512" r="292" fill="none" stroke="#4c8dff" stroke-width="64" />
+  <circle cx="512" cy="512" r="150" fill="none" stroke="#4c8dff" stroke-width="36" opacity="0.55" />
+  <path
+    d="M512 150v170M512 704v170M150 512h170M704 512h170"
+    stroke="#e6e8ec"
+    stroke-width="56"
+    stroke-linecap="round"
+  />
+  <circle cx="512" cy="512" r="56" fill="#3ecf8e" />
+</svg>

@@ -6,10 +6,9 @@ Windows only. Port scanning / packet capture / Linux come later – keep platfor
 
 ## Current phase
 
-**Phase 4 done** (export: CSV, JSON, HTML report; all addresses or the filtered view).
-Next: **Phase 5** - polish: README (English + German section, build instructions, features,
-screenshot placeholder, legal note), real app icons, `npm run tauri build` (NSIS), tag `v0.1.0`,
-GitHub release with the installer.
+**All 5 phases done - v0.1.0 released** (README en/de, app icon, NSIS installer, GitHub release).
+Next: whatever the user asks for (ideas: screenshots in `docs/`, code signing, HTTPS titles
+(needs a TLS crate - ask), port scanning, packet capture, Linux backend).
 
 Phases: 0 scaffold · 1 backend core · 2 enrichment · 3 UI · 4 export · 5 polish/release.
 After each phase: fmt + clippy + tests, commit, push, short summary, **wait for the user's OK**.
@@ -47,7 +46,18 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
 - Lib crate has no mobile crate-types (desktop only). Bundle target: NSIS only.
 - Data types use `IpAddr` (IPv4 only in v1, IPv6 not blocked by design).
 - Online = ARP answers OR ICMP answers OR any TCP probe connects.
-- Icons are still the Tauri template defaults → replace in phase 5.
+- App icon source: `app-icon.svg` (self-made). Regenerate with `npx tauri icon app-icon.svg`,
+  then delete `src-tauri/icons/android` and `src-tauri/icons/ios` (desktop only).
+
+## Releasing
+
+1. Bump the version in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`.
+2. `npm run tauri build` (several minutes, LTO). The bundler fetches its NSIS toolchain into
+   `%LOCALAPPDATA%\tauri` on first use. Output:
+   `src-tauri/target/release/bundle/nsis/Ironsight_<version>_x64-setup.exe`.
+3. Commit, `git tag -a v<version>`, push with tags, then
+   `gh release create v<version> <installer> --notes-file <notes>` (notes include SHA-256).
+   The installer is unsigned (SmartScreen warning is documented in the README).
 
 ## Backend design (phase 1)
 

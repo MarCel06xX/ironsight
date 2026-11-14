@@ -30,7 +30,19 @@
     "active": true,
     "targets": ["nsis"],
     "license": "MIT OR Apache-2.0",
+    "publisher": "MarCel06xX",
+    "copyright": "Copyright (c) 2026 MarCel06xX. Licensed under MIT OR Apache-2.0.",
+    "homepage": "https://github.com/MarCel06xX/ironsight",
+    "category": "Utility",
     "shortDescription": "Network scanner",
+    "longDescription": "Open-source desktop network scanner: host discovery, device information and export.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "German"],
+        "displayLanguageSelector": false
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
