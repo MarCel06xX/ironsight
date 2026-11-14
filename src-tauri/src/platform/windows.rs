@@ -5,10 +5,9 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-    GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, ICMP_ECHO_REPLY,
-    IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH, IP_SUCCESS, IcmpCloseHandle,
-    IcmpCreateFile, IcmpSendEcho, SendARP,
+    GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
+    GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, ICMP_ECHO_REPLY, IF_TYPE_SOFTWARE_LOOPBACK,
+    IP_ADAPTER_ADDRESSES_LH, IP_SUCCESS, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, SendARP,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKET_ADDRESS};
@@ -36,10 +35,7 @@ pub struct WindowsBackend;
 impl NetBackend for WindowsBackend {
     fn list_adapters(&self) -> Result<Vec<Adapter>, NetError> {
         let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
-            GAA_FLAG_SKIP_ANYCAST.0
-                | GAA_FLAG_SKIP_MULTICAST.0
-                | GAA_FLAG_SKIP_DNS_SERVER.0
-                | GAA_FLAG_INCLUDE_GATEWAYS.0,
+            GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_INCLUDE_GATEWAYS.0,
         );
         let mut size: u32 = 16 * 1024;
         // The adapter list can grow between calls, so retry a few times with the reported size.
@@ -220,6 +216,18 @@ unsafe fn collect_adapters(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter
             has_gateway |= unsafe { sockaddr_v4(&entry.Address) }.is_some();
         }
 
+        let mut dns_servers = Vec::new();
+        let mut dns = adapter.FirstDnsServerAddress;
+        while !dns.is_null() {
+            // SAFETY: non-null list node inside the live buffer.
+            let entry = unsafe { &*dns };
+            dns = entry.Next;
+            // SAFETY: the socket address belongs to the same live buffer.
+            if let Some(server) = unsafe { sockaddr_v4(&entry.Address) } {
+                dns_servers.push(server);
+            }
+        }
+
         let mac = (adapter.PhysicalAddressLength == 6)
             .then(|| {
                 let p = adapter.PhysicalAddress;
@@ -242,6 +250,7 @@ unsafe fn collect_adapters(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter
             description,
             mac,
             ipv4,
+            dns_servers,
             has_gateway,
         });
     }
@@ -342,15 +351,17 @@ mod tests {
 }
 
 /// Manual check against the real network: `cargo test live_scan -- --ignored --nocapture`.
+/// Prints only which kinds of data were found, not the data itself.
 #[cfg(test)]
 mod live {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use super::*;
+    use crate::enrich::NetEnricher;
     use crate::scan::ScanConfig;
     use crate::scan::engine::run_scan;
     use crate::scan::range::TargetSet;
+    use tokio::sync::watch;
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "scans the local subnet of the first adapter with a gateway"]
@@ -364,34 +375,47 @@ mod live {
             println!("no adapter with a gateway, nothing to scan");
             return;
         };
+        let dns_servers: usize = adapters.iter().map(|a| a.dns_servers.len()).sum();
         // Never more than the /24 around the adapter address.
         let [a, b, c, _] = net.addr.octets();
         let target = format!("{a}.{b}.{c}.0/24");
+        let (_cancel, cancelled) = watch::channel(false);
         let started = std::time::Instant::now();
         let summary = run_scan(
             Arc::new(WindowsBackend),
+            Arc::new(NetEnricher::new(&adapters)),
             TargetSet::parse(&target).unwrap(),
             ScanConfig {
                 concurrency: 64,
                 timeout: Duration::from_millis(1000),
             },
-            Arc::new(AtomicBool::new(false)),
+            cancelled,
             1,
             |batch| {
-                for host in batch.hosts.iter().filter(|h| h.online) {
+                for host in batch.hosts.iter().filter(|h| h.online && h.complete) {
+                    let ports: Vec<u16> = host.services.iter().map(|s| s.port).collect();
+                    let http = host.services.iter().filter_map(|s| s.http.as_ref());
                     println!(
-                        "online: mac={} rtt={:?} arp={} icmp={}",
-                        host.mac.is_some(),
-                        host.rtt_ms,
+                        "online: arp={} icmp={} tcp={} mac={} local={} vendor={} dns={} mdns={} netbios={} workgroup={} ports={ports:?} http_server={} http_title={}",
                         host.seen_by.arp,
-                        host.seen_by.icmp
+                        host.seen_by.icmp,
+                        host.seen_by.tcp,
+                        host.mac.is_some(),
+                        host.mac_local,
+                        host.vendor.is_some(),
+                        host.names.dns.is_some(),
+                        host.names.mdns.is_some(),
+                        host.names.netbios.is_some(),
+                        host.workgroup.is_some(),
+                        http.clone().any(|h| h.server.is_some()),
+                        http.clone().any(|h| h.title.is_some()),
                     );
                 }
             },
         )
         .await;
         println!(
-            "prefix=/{} scanned={} online={} errors={} in {:?}",
+            "prefix=/{} dns_servers={dns_servers} scanned={} online={} errors={} in {:?}",
             net.prefix_len,
             summary.scanned,
             summary.online,

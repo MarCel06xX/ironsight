@@ -1,6 +1,7 @@
-//! Ironsight backend. Further modules (enrich, export) are added per phase.
+//! Ironsight backend. The export module is added in a later phase.
 
 mod commands;
+mod enrich;
 mod error;
 mod mac;
 mod platform;

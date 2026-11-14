@@ -1,12 +1,14 @@
 //! Tauri commands. All input from the webview is validated here before it reaches the engine.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::watch;
 
+use crate::enrich::NetEnricher;
 use crate::error::CommandError;
 use crate::platform::{Adapter, NetBackend};
 use crate::scan::engine::run_scan;
@@ -21,7 +23,7 @@ pub const EVENT_SCAN_FINISHED: &str = "scan:finished";
 
 struct ActiveScan {
     id: u64,
-    cancel: Arc<AtomicBool>,
+    cancel: watch::Sender<bool>,
 }
 
 pub struct AppState {
@@ -45,7 +47,7 @@ impl AppState {
     }
 
     /// Registers a new scan; only one may run at a time.
-    fn begin_scan(&self) -> Result<(u64, Arc<AtomicBool>), CommandError> {
+    fn begin_scan(&self) -> Result<(u64, watch::Receiver<bool>), CommandError> {
         let mut active = self.active();
         if active.is_some() {
             return Err(CommandError::new(
@@ -54,12 +56,9 @@ impl AppState {
             ));
         }
         let id = self.next_scan_id.fetch_add(1, Ordering::Relaxed);
-        let cancel = Arc::new(AtomicBool::new(false));
-        *active = Some(ActiveScan {
-            id,
-            cancel: Arc::clone(&cancel),
-        });
-        Ok((id, cancel))
+        let (cancel, cancelled) = watch::channel(false);
+        *active = Some(ActiveScan { id, cancel });
+        Ok((id, cancelled))
     }
 
     fn end_scan(&self, id: u64) {
@@ -71,7 +70,7 @@ impl AppState {
 
     fn cancel_scan(&self) {
         if let Some(scan) = self.active().as_ref() {
-            scan.cancel.store(true, Ordering::Relaxed);
+            scan.cancel.send_replace(true);
         }
     }
 }
@@ -137,10 +136,20 @@ pub async fn start_scan(
 
     tauri::async_runtime::spawn(async move {
         let emitter = app.clone();
-        let summary = run_scan(backend, targets, config, cancel, scan_id, move |batch| {
+        let on_batch = move |batch| {
             let _ = emitter.emit(EVENT_SCAN_BATCH, batch);
-        })
-        .await;
+        };
+        // The enricher needs the adapters to pick DNS servers; a failure only costs names.
+        let adapters = {
+            let backend = Arc::clone(&backend);
+            tauri::async_runtime::spawn_blocking(move || backend.list_adapters())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default()
+        };
+        let probes = Arc::new(NetEnricher::new(&adapters));
+        let summary = run_scan(backend, probes, targets, config, cancel, scan_id, on_batch).await;
         // Free the slot first, so the frontend can start a new scan right after the event.
         app.state::<AppState>().end_scan(scan_id);
         let _ = app.emit(EVENT_SCAN_FINISHED, summary);
@@ -202,13 +211,13 @@ mod tests {
         assert_eq!(state.begin_scan().unwrap_err().code, "scan.already_running");
 
         state.cancel_scan();
-        assert!(cancel.load(Ordering::Relaxed));
+        assert!(*cancel.borrow());
 
         state.end_scan(first + 1); // a stale id must not free the slot
         assert!(state.begin_scan().is_err());
         state.end_scan(first);
         let (second, cancel) = state.begin_scan().unwrap();
         assert!(second > first);
-        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!*cancel.borrow());
     }
 }

@@ -1,17 +1,17 @@
 //! Scan orchestration: bounded concurrency, per-host timeout, cancellation and batched
-//! live results. Independent of Tauri so it can be tested with a mock backend.
+//! live results. Independent of Tauri and of real network I/O (see [`NetBackend`] and
+//! [`HostProbes`]), so it can be tested with mocks.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Semaphore, mpsc};
-use tokio::task::spawn_blocking;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::MissedTickBehavior;
 
 use super::range::TargetSet;
-use super::{HostResult, ScanBatch, ScanConfig, ScanSummary, SeenBy};
+use super::{HostResult, ScanBatch, ScanConfig, ScanSummary, SeenBy, ServiceInfo};
 use crate::mac::MacAddr;
 use crate::platform::{Ipv4Net, NetBackend, NetError};
 
@@ -19,9 +19,24 @@ use crate::platform::{Ipv4Net, NetBackend, NetError};
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// ... or earlier, once this many have piled up.
 const MAX_BATCH: usize = 512;
-/// SendARP cannot be aborted and blocks for about 3 s on silent hosts. Hosts are reported
-/// after the configured timeout anyway; this caps the threads still waiting in the OS.
+/// The OS ARP call cannot be aborted and blocks for about 3 s on silent hosts (it retries
+/// once per second). This caps the threads waiting in it.
 const MAX_ARP_THREADS: usize = 240;
+/// Safety net for waiting on an ARP call; the OS gives up well before this.
+const ARP_HARD_LIMIT: Duration = Duration::from_secs(5);
+
+/// Portable (socket-based) probing and enrichment, implemented by `enrich::NetEnricher`.
+pub trait HostProbes: Send + Sync + 'static {
+    /// Ports from the probe list that accept a TCP connection, ascending.
+    fn open_ports(&self, ip: IpAddr, timeout: Duration) -> impl Future<Output = Vec<u16>> + Send;
+
+    /// Adds names, vendor and service details to a host that was found online.
+    fn enrich(
+        &self,
+        host: HostResult,
+        timeout: Duration,
+    ) -> impl Future<Output = HostResult> + Send;
+}
 
 /// A local IPv4 subnet; hosts inside it can be resolved via ARP.
 struct LocalLink {
@@ -29,37 +44,60 @@ struct LocalLink {
     mac: Option<MacAddr>,
 }
 
-struct Probe {
-    host: HostResult,
-    had_error: bool,
+enum Update {
+    /// First result for a host; counts towards the progress.
+    Probed { host: HostResult, had_error: bool },
+    /// Same host again with more data. `became_online`: it was reported offline before.
+    Changed {
+        host: HostResult,
+        became_online: bool,
+    },
+}
+
+type ArpHandle = JoinHandle<Result<Option<MacAddr>, NetError>>;
+
+/// Everything a host task needs, shared between all of them.
+struct Shared<P> {
+    backend: Arc<dyn NetBackend>,
+    probes: Arc<P>,
+    links: Vec<LocalLink>,
+    host_slots: Arc<Semaphore>,
+    arp_slots: Arc<Semaphore>,
+    timeout: Duration,
+    cancel: watch::Receiver<bool>,
 }
 
 /// Scans all targets and reports results through `on_batch` while running.
-/// Setting `cancel` stops starting new hosts; hosts already in flight still finish.
-pub async fn run_scan<F>(
+/// Setting `cancel` to `true` stops the scan: no new hosts are started and pending
+/// lookups are dropped; hosts in the middle of their probe are still reported.
+pub async fn run_scan<P, F>(
     backend: Arc<dyn NetBackend>,
+    probes: Arc<P>,
     targets: TargetSet,
     config: ScanConfig,
-    cancel: Arc<AtomicBool>,
+    cancel: watch::Receiver<bool>,
     scan_id: u64,
     on_batch: F,
 ) -> ScanSummary
 where
+    P: HostProbes,
     F: Fn(ScanBatch) + Send,
 {
     let started_at_ms = now_ms();
     let total = targets.len() as u32;
-    let links = Arc::new(local_links(&backend).await);
-
-    let (tx, mut rx) = mpsc::channel::<Probe>(1024);
-    let producer = tokio::spawn(produce(
+    let concurrency = config.concurrency.max(1);
+    let shared = Arc::new(Shared {
+        links: local_links(&backend).await,
         backend,
-        targets,
-        config,
-        Arc::clone(&cancel),
-        links,
-        tx,
-    ));
+        probes,
+        host_slots: Arc::new(Semaphore::new(concurrency)),
+        arp_slots: Arc::new(Semaphore::new((concurrency * 3).min(MAX_ARP_THREADS))),
+        timeout: config.timeout,
+        cancel: cancel.clone(),
+    });
+
+    let (tx, mut rx) = mpsc::channel::<Update>(1024);
+    let producer = tokio::spawn(produce(shared, targets, tx));
 
     let (mut scanned, mut online, mut errors) = (0u32, 0u32, 0u32);
     let mut pending: Vec<HostResult> = Vec::new();
@@ -77,13 +115,21 @@ where
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            probe = rx.recv() => {
+            update = rx.recv() => {
                 // The channel closes once the producer and all host tasks are done.
-                let Some(probe) = probe else { break };
-                scanned += 1;
-                online += u32::from(probe.host.online);
-                errors += u32::from(probe.had_error);
-                pending.push(probe.host);
+                let Some(update) = update else { break };
+                match update {
+                    Update::Probed { host, had_error } => {
+                        scanned += 1;
+                        online += u32::from(host.online);
+                        errors += u32::from(had_error);
+                        pending.push(host);
+                    }
+                    Update::Changed { host, became_online } => {
+                        online += u32::from(became_online);
+                        pending.push(host);
+                    }
+                }
                 if pending.len() >= MAX_BATCH {
                     flush(&mut pending, scanned, online);
                 }
@@ -102,7 +148,7 @@ where
 
     ScanSummary {
         scan_id,
-        cancelled: cancel.load(Ordering::Relaxed) && scanned < total,
+        cancelled: *cancel.borrow() && scanned < total,
         scanned,
         total,
         online,
@@ -112,78 +158,184 @@ where
     }
 }
 
-/// Starts one task per host, never more than `config.concurrency` at a time.
-async fn produce(
-    backend: Arc<dyn NetBackend>,
-    targets: TargetSet,
-    config: ScanConfig,
-    cancel: Arc<AtomicBool>,
-    links: Arc<Vec<LocalLink>>,
-    tx: mpsc::Sender<Probe>,
-) {
-    let concurrency = config.concurrency.max(1);
-    let host_slots = Arc::new(Semaphore::new(concurrency));
-    let arp_slots = Arc::new(Semaphore::new((concurrency * 3).min(MAX_ARP_THREADS)));
+/// Resolves once the scan is cancelled (never, if the sender is gone).
+async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
 
+/// Starts one task per host; at most `concurrency` hosts are probed at the same time.
+async fn produce<P: HostProbes>(
+    shared: Arc<Shared<P>>,
+    targets: TargetSet,
+    tx: mpsc::Sender<Update>,
+) {
+    let mut cancel = shared.cancel.clone();
     for ip in targets.iter() {
-        let Ok(permit) = Arc::clone(&host_slots).acquire_owned().await else {
-            break;
+        let permit = tokio::select! {
+            permit = Arc::clone(&shared.host_slots).acquire_owned() => permit,
+            _ = cancelled(&mut cancel) => break,
         };
-        if cancel.load(Ordering::Relaxed) {
+        let Ok(permit) = permit else { break };
+        if shared.is_cancelled() {
             break;
         }
-        let backend = Arc::clone(&backend);
-        let links = Arc::clone(&links);
-        let arp_slots = Arc::clone(&arp_slots);
+        let shared = Arc::clone(&shared);
         let tx = tx.clone();
         tokio::spawn(async move {
-            let probe = probe_host(backend, ip, &links, arp_slots, config.timeout).await;
-            let _ = tx.send(probe).await;
-            drop(permit);
+            let mut cancel = shared.cancel.clone();
+            if let Some(follow_up) = probe_and_report(&shared, ip, &tx, permit).await {
+                // Lookups after the first report are dropped when the scan is stopped.
+                tokio::select! {
+                    _ = follow_up.run(&shared, &tx) => {}
+                    _ = cancelled(&mut cancel) => {}
+                }
+            }
         });
     }
 }
 
-/// ARP (on-link targets only) and ICMP run in parallel; the host is online if either answers.
-async fn probe_host(
-    backend: Arc<dyn NetBackend>,
+/// Work left for a host after its first report.
+struct FollowUp {
+    host: HostResult,
+    /// ARP call that had not returned when the probe timeout expired.
+    arp: Option<ArpHandle>,
+    permit: OwnedSemaphorePermit,
+}
+
+/// Probes one host and sends its first report. Returns what is left to do, if anything.
+async fn probe_and_report<P: HostProbes>(
+    shared: &Shared<P>,
     ip: Ipv4Addr,
-    links: &[LocalLink],
-    arp_slots: Arc<Semaphore>,
-    timeout: Duration,
-) -> Probe {
-    // One of this machine's own addresses: online by definition, MAC known from the adapter.
-    let own = links.iter().find(|link| link.net.addr == ip);
-    let arp_src = match own {
-        Some(_) => None,
-        None => links
+    tx: &mpsc::Sender<Update>,
+    permit: OwnedSemaphorePermit,
+) -> Option<FollowUp> {
+    let (mut host, had_error, arp) = discover(shared, ip).await;
+    // Offline hosts have nothing to look up; a late ARP answer may still revive them.
+    host.complete = !host.online || shared.is_cancelled();
+    let first = Update::Probed {
+        host: host.clone(),
+        had_error,
+    };
+    if tx.send(first).await.is_err() || shared.is_cancelled() {
+        return None;
+    }
+    (host.online || arp.is_some()).then_some(FollowUp { host, arp, permit })
+}
+
+impl FollowUp {
+    async fn run<P: HostProbes>(self, shared: &Shared<P>, tx: &mpsc::Sender<Update>) {
+        let Self {
+            mut host,
+            mut arp,
+            mut permit,
+        } = self;
+
+        if !host.online {
+            // Nothing answered within the timeout, but the OS is still asking via ARP
+            // (sleeping phones often answer the second request). Waiting needs no slot.
+            drop(permit);
+            let Some(mac) = late_arp(arp.take()).await else {
+                return;
+            };
+            host.online = true;
+            host.complete = false;
+            host.seen_by.arp = true;
+            host.set_mac(mac);
+            let revived = Update::Changed {
+                host: host.clone(),
+                became_online: true,
+            };
+            if tx.send(revived).await.is_err() {
+                return;
+            }
+            let Ok(slot) = Arc::clone(&shared.host_slots).acquire_owned().await else {
+                return;
+            };
+            permit = slot;
+        }
+
+        let (mut host, late_mac) = tokio::join!(
+            shared.probes.enrich(host, shared.timeout),
+            late_arp(arp.take())
+        );
+        if let Some(mac) = late_mac {
+            host.seen_by.arp = true;
+            host.set_mac(mac);
+        }
+        host.complete = true;
+        let enriched = Update::Changed {
+            host,
+            became_online: false,
+        };
+        let _ = tx.send(enriched).await;
+        drop(permit);
+    }
+}
+
+/// Waits for an ARP call that outlived the probe timeout.
+async fn late_arp(handle: Option<ArpHandle>) -> Option<MacAddr> {
+    let result = tokio::time::timeout(ARP_HARD_LIMIT, handle?).await;
+    result.ok()?.ok()?.ok()?
+}
+
+impl<P> Shared<P> {
+    fn is_cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    /// Local address to send ARP requests for `ip` from; `None` if `ip` is off-link or
+    /// one of this machine's own addresses.
+    fn arp_source(&self, ip: Ipv4Addr) -> Option<Ipv4Addr> {
+        if self.links.iter().any(|link| link.net.addr == ip) {
+            return None;
+        }
+        self.links
             .iter()
             .find(|link| link.net.contains(ip))
-            .map(|link| link.net.addr),
-    };
+            .map(|link| link.net.addr)
+    }
 
+    /// Starts the blocking ARP call once a thread slot is free.
+    async fn spawn_arp(&self, ip: Ipv4Addr, src: Ipv4Addr) -> Option<ArpHandle> {
+        let permit = Arc::clone(&self.arp_slots).acquire_owned().await.ok()?;
+        let backend = Arc::clone(&self.backend);
+        Some(spawn_blocking(move || {
+            let _permit = permit; // released when the OS call returns, not when we stop waiting
+            backend.arp_resolve(ip, Some(src))
+        }))
+    }
+}
+
+/// ARP (on-link targets only), ICMP and the TCP probes run in parallel; the host is online
+/// if any of them gets an answer within the timeout. Returns the host, whether a probe hit
+/// an OS error, and the ARP call if it is still running.
+async fn discover<P: HostProbes>(
+    shared: &Shared<P>,
+    ip: Ipv4Addr,
+) -> (HostResult, bool, Option<ArpHandle>) {
+    let timeout = shared.timeout;
+    // One of this machine's own addresses: online by definition, MAC known from the adapter.
+    let own = shared.links.iter().find(|link| link.net.addr == ip);
+
+    let mut arp_handle = match shared.arp_source(ip) {
+        Some(src) => shared.spawn_arp(ip, src).await,
+        None => None,
+    };
     let icmp_task = {
-        let backend = Arc::clone(&backend);
+        let backend = Arc::clone(&shared.backend);
         spawn_blocking(move || backend.icmp_ping(IpAddr::V4(ip), timeout))
     };
     let arp_task = async {
-        let Some(src) = arp_src else {
-            return Ok(None);
-        };
-        let Ok(permit) = arp_slots.acquire_owned().await else {
-            return Ok(None);
-        };
-        let handle = spawn_blocking(move || {
-            let _permit = permit; // released when the OS call returns, not when we stop waiting
-            backend.arp_resolve(ip, Some(src))
-        });
-        match tokio::time::timeout(timeout, handle).await {
-            Ok(Ok(result)) => result,
-            // Deadline passed (the thread finishes on its own) or the task panicked.
-            _ => Ok::<_, NetError>(None),
+        match arp_handle.as_mut() {
+            // `None`: not finished within the timeout, the handle stays valid.
+            Some(handle) => tokio::time::timeout(timeout, handle).await.ok(),
+            None => Some(Ok(Ok(None))),
         }
     };
-    let (icmp, arp) = tokio::join!(icmp_task, arp_task);
+    let tcp_task = shared.probes.open_ports(IpAddr::V4(ip), timeout);
+    let (icmp, arp, open_ports) = tokio::join!(icmp_task, arp_task, tcp_task);
 
     let mut had_error = false;
     let rtt = match icmp {
@@ -193,26 +345,29 @@ async fn probe_host(
             None
         }
     };
-    let arp_mac = arp.unwrap_or_else(|_| {
-        had_error = true;
-        None
-    });
+    let (arp_mac, arp_pending) = match arp {
+        Some(Ok(Ok(mac))) => (mac, None),
+        Some(_) => {
+            had_error = true;
+            (None, None)
+        }
+        None => (None, arp_handle),
+    };
 
-    let seen_by = SeenBy {
+    let mut host = HostResult::new(IpAddr::V4(ip));
+    host.seen_by = SeenBy {
         arp: arp_mac.is_some(),
         icmp: rtt.is_some(),
+        tcp: !open_ports.is_empty(),
     };
-    Probe {
-        host: HostResult {
-            ip: IpAddr::V4(ip),
-            online: own.is_some() || seen_by.arp || seen_by.icmp,
-            mac: own.and_then(|link| link.mac).or(arp_mac),
-            rtt_ms: rtt.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
-            seen_by,
-            timestamp_ms: now_ms(),
-        },
-        had_error,
+    host.online = own.is_some() || host.seen_by.arp || host.seen_by.icmp || host.seen_by.tcp;
+    host.rtt_ms = rtt.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+    host.services = open_ports.into_iter().map(ServiceInfo::open).collect();
+    if let Some(mac) = own.and_then(|link| link.mac).or(arp_mac) {
+        host.set_mac(mac);
     }
+    host.timestamp_ms = now_ms();
+    (host, had_error, arp_pending)
 }
 
 async fn local_links(backend: &Arc<dyn NetBackend>) -> Vec<LocalLink> {
@@ -242,21 +397,25 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use super::*;
     use crate::platform::Adapter;
+    use crate::scan::NameSource;
 
     const OWN_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-    const OWN_MAC: MacAddr = MacAddr([2, 0, 0, 0, 0, 1]);
+    const OWN_MAC: MacAddr = MacAddr([0x00, 0x00, 0x0c, 0, 0, 1]);
+    const TIMEOUT: Duration = Duration::from_millis(200);
 
     /// Fake network 10.0.0.0/24 with this machine at 10.0.0.1.
     #[derive(Default)]
     struct MockBackend {
         arp_hosts: HashSet<Ipv4Addr>,
         icmp_hosts: HashSet<Ipv4Addr>,
+        /// How long every ARP call blocks before it returns.
         arp_delay: Duration,
         fail_icmp: bool,
         arp_calls: Mutex<Vec<(Ipv4Addr, Option<Ipv4Addr>)>>,
@@ -272,6 +431,7 @@ mod tests {
                 description: String::new(),
                 mac: Some(OWN_MAC),
                 ipv4: vec![Ipv4Net::new(OWN_IP, 24)],
+                dns_servers: Vec::new(),
                 has_gateway: true,
             }])
         }
@@ -312,41 +472,96 @@ mod tests {
         }
     }
 
+    /// TCP ports per host; enrichment just derives a DNS name from the address.
+    #[derive(Default)]
+    struct MockProbes {
+        open: HashMap<Ipv4Addr, Vec<u16>>,
+        enrich_delay: Duration,
+        enriched: Mutex<Vec<IpAddr>>,
+    }
+
+    impl HostProbes for MockProbes {
+        async fn open_ports(&self, ip: IpAddr, _timeout: Duration) -> Vec<u16> {
+            match ip {
+                IpAddr::V4(v4) => self.open.get(&v4).cloned().unwrap_or_default(),
+                IpAddr::V6(_) => Vec::new(),
+            }
+        }
+
+        async fn enrich(&self, mut host: HostResult, _timeout: Duration) -> HostResult {
+            self.enriched.lock().unwrap().push(host.ip);
+            tokio::time::sleep(self.enrich_delay).await;
+            host.names.dns = Some(format!("host-{}.lan", host.ip));
+            host.pick_hostname();
+            host
+        }
+    }
+
     fn ip(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(10, 0, 0, last)
     }
 
-    async fn scan(
+    /// Runs a scan; `cancel_after` stops it after that delay (zero: before it starts).
+    async fn scan_with(
         backend: Arc<MockBackend>,
+        probes: Arc<MockProbes>,
         targets: &str,
-        concurrency: usize,
-        cancel: bool,
-    ) -> (Vec<ScanBatch>, ScanSummary) {
+        cancel_after: Option<Duration>,
+    ) -> (Vec<HostResult>, ScanSummary) {
+        let (cancel_tx, cancel_rx) = watch::channel(cancel_after == Some(Duration::ZERO));
+        let stopper = tokio::spawn(async move {
+            match cancel_after {
+                Some(delay) => {
+                    tokio::time::sleep(delay).await;
+                    cancel_tx.send_replace(true);
+                }
+                // Keep the sender alive for the whole scan.
+                None => cancel_tx.closed().await,
+            }
+        });
         let batches = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&batches);
         let summary = run_scan(
             backend,
+            probes,
             TargetSet::parse(targets).unwrap(),
             ScanConfig {
-                concurrency,
-                timeout: Duration::from_millis(200),
+                concurrency: 4,
+                timeout: TIMEOUT,
             },
-            Arc::new(AtomicBool::new(cancel)),
+            cancel_rx,
             7,
-            move |batch| sink.lock().unwrap().push(batch),
+            move |batch: ScanBatch| sink.lock().unwrap().push(batch),
         )
         .await;
+        stopper.abort();
         let batches = std::mem::take(&mut *batches.lock().unwrap());
-        (batches, summary)
+        // Totals in the last batch always match the summary.
+        if let Some(last) = batches.last() {
+            assert_eq!(
+                (last.scan_id, last.scanned, last.total, last.online),
+                (7, summary.scanned, summary.total, summary.online)
+            );
+        }
+        let updates = batches.into_iter().flat_map(|b| b.hosts).collect();
+        (updates, summary)
     }
 
-    fn host(batches: &[ScanBatch], addr: Ipv4Addr) -> HostResult {
-        batches
+    async fn scan(backend: Arc<MockBackend>, targets: &str) -> (Vec<HostResult>, ScanSummary) {
+        scan_with(backend, Arc::default(), targets, None).await
+    }
+
+    /// All reports for one address, in the order they were sent.
+    fn reports(updates: &[HostResult], addr: Ipv4Addr) -> Vec<&HostResult> {
+        updates
             .iter()
-            .flat_map(|b| &b.hosts)
-            .find(|h| h.ip == IpAddr::V4(addr))
-            .cloned()
-            .unwrap()
+            .filter(|h| h.ip == IpAddr::V4(addr))
+            .collect()
+    }
+
+    /// The final state of one address.
+    fn host(updates: &[HostResult], addr: Ipv4Addr) -> &HostResult {
+        reports(updates, addr).pop().unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -356,50 +571,102 @@ mod tests {
             icmp_hosts: [ip(5), ip(12)].into(),
             ..Default::default()
         });
-        let (batches, summary) = scan(Arc::clone(&backend), "10.0.0.1-20", 4, false).await;
+        let (updates, summary) = scan(Arc::clone(&backend), "10.0.0.2-20").await;
 
-        assert_eq!(
-            (summary.scan_id, summary.total, summary.scanned),
-            (7, 20, 20)
-        );
-        assert_eq!((summary.online, summary.errors), (4, 0));
+        assert_eq!((summary.total, summary.scanned), (19, 19));
+        assert_eq!((summary.online, summary.errors), (3, 0));
         assert!(!summary.cancelled);
         assert!(summary.finished_at_ms >= summary.started_at_ms);
+        // Every host once, online hosts a second time after enrichment.
+        assert_eq!(updates.len(), 19 + 3);
 
-        let count: usize = batches.iter().map(|b| b.hosts.len()).sum();
-        assert_eq!(count, 20);
-        let last = batches.last().unwrap();
-        assert_eq!((last.scanned, last.total, last.online), (20, 20, 4));
-
-        let both = host(&batches, ip(5));
-        assert!(both.online && both.seen_by.arp && both.seen_by.icmp);
+        let both = host(&updates, ip(5));
+        assert!(both.online && both.seen_by.arp && both.seen_by.icmp && !both.seen_by.tcp);
         assert_eq!(both.mac, Some(MacAddr([2, 0, 0, 0, 0, 5])));
         assert_eq!(both.rtt_ms, Some(3));
+        assert!(both.timestamp_ms > 0);
 
-        let arp_only = host(&batches, ip(9));
+        let arp_only = host(&updates, ip(9));
         assert!(arp_only.online && arp_only.seen_by.arp && !arp_only.seen_by.icmp);
         assert_eq!(arp_only.rtt_ms, None);
 
-        let icmp_only = host(&batches, ip(12));
+        let icmp_only = host(&updates, ip(12));
         assert!(icmp_only.online && icmp_only.mac.is_none());
 
-        let offline = host(&batches, ip(13));
+        let offline = host(&updates, ip(13));
         assert!(!offline.online && offline.mac.is_none() && offline.rtt_ms.is_none());
 
         assert!(backend.max_in_flight.load(Ordering::SeqCst) <= 4);
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn online_hosts_are_reported_twice_offline_hosts_once() {
+        let backend = Arc::new(MockBackend {
+            icmp_hosts: [ip(5)].into(),
+            ..Default::default()
+        });
+        let probes = Arc::new(MockProbes::default());
+        let (updates, summary) = scan_with(backend, Arc::clone(&probes), "10.0.0.5-6", None).await;
+
+        let online = reports(&updates, ip(5));
+        assert_eq!(online.len(), 2);
+        assert!(online[0].online && !online[0].complete && online[0].hostname.is_none());
+        assert!(online[1].complete);
+        assert_eq!(online[1].hostname.as_deref(), Some("host-10.0.0.5.lan"));
+        assert_eq!(online[1].hostname_source, Some(NameSource::Dns));
+        // Enrichment keeps what discovery found.
+        assert_eq!(online[1].rtt_ms, online[0].rtt_ms);
+
+        let offline = reports(&updates, ip(6));
+        assert_eq!(offline.len(), 1);
+        assert!(!offline[0].online && offline[0].complete);
+
+        // The second report does not count twice.
+        assert_eq!((summary.scanned, summary.online), (2, 1));
+        assert_eq!(*probes.enriched.lock().unwrap(), [IpAddr::V4(ip(5))]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_tcp_port_alone_makes_a_host_online() {
+        let backend = Arc::new(MockBackend::default());
+        let probes = Arc::new(MockProbes {
+            open: [(ip(7), vec![80, 443])].into(),
+            ..Default::default()
+        });
+        let (updates, summary) = scan_with(backend, probes, "10.0.0.7-8", None).await;
+
+        assert_eq!(summary.online, 1);
+        let found = host(&updates, ip(7));
+        assert!(found.online && found.seen_by.tcp && !found.seen_by.arp && !found.seen_by.icmp);
+        let services: Vec<_> = found.services.iter().map(|s| (s.port, s.name)).collect();
+        assert_eq!(services, [(80, "http"), (443, "https")]);
+        assert!(!host(&updates, ip(8)).online);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn own_address_is_online_without_arp() {
         let backend = Arc::new(MockBackend::default());
-        let (batches, summary) = scan(Arc::clone(&backend), "10.0.0.1-2", 4, false).await;
+        let (updates, summary) = scan(Arc::clone(&backend), "10.0.0.1-2").await;
 
-        let own = host(&batches, OWN_IP);
+        let own = host(&updates, OWN_IP);
         assert!(own.online && !own.seen_by.arp);
         assert_eq!(own.mac, Some(OWN_MAC));
+        assert!(own.vendor.is_some() && !own.mac_local);
         assert_eq!(summary.online, 1);
         // Only the other host is asked via ARP, from our own address.
         assert_eq!(*backend.arp_calls.lock().unwrap(), [(ip(2), Some(OWN_IP))]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn randomized_mac_is_flagged_and_has_no_vendor() {
+        let backend = Arc::new(MockBackend {
+            arp_hosts: [ip(5)].into(),
+            ..Default::default()
+        });
+        let (updates, _) = scan(backend, "10.0.0.5").await;
+        // The mock answers ARP with locally administered 02:... addresses.
+        let found = host(&updates, ip(5));
+        assert!(found.mac_local && found.vendor.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -409,26 +676,90 @@ mod tests {
             icmp_hosts: [remote].into(),
             ..Default::default()
         });
-        let (batches, summary) = scan(Arc::clone(&backend), "192.168.50.1-2", 4, false).await;
+        let (updates, summary) = scan(Arc::clone(&backend), "192.168.50.1-2").await;
 
         assert_eq!(summary.online, 1);
-        assert!(host(&batches, remote).mac.is_none());
+        assert!(host(&updates, remote).mac.is_none());
         assert!(backend.arp_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn slow_arp_is_cut_off_at_the_timeout() {
+    async fn slow_arp_answer_adds_the_mac_to_an_online_host() {
+        // ICMP answers at once, ARP only after the probe timeout.
         let backend = Arc::new(MockBackend {
             arp_hosts: [ip(5)].into(),
-            arp_delay: Duration::from_millis(1500),
+            icmp_hosts: [ip(5)].into(),
+            arp_delay: TIMEOUT * 2,
             ..Default::default()
         });
-        let started = std::time::Instant::now();
-        let (batches, summary) = scan(backend, "10.0.0.5", 4, false).await;
+        let (updates, summary) = scan(Arc::clone(&backend), "10.0.0.5").await;
 
-        assert!(started.elapsed() < Duration::from_millis(1200));
-        assert_eq!(summary.online, 0);
-        assert!(!host(&batches, ip(5)).online);
+        let reports = reports(&updates, ip(5));
+        assert_eq!(reports.len(), 2);
+        assert!(reports[0].online && reports[0].mac.is_none() && !reports[0].seen_by.arp);
+        assert_eq!(reports[1].mac, Some(MacAddr([2, 0, 0, 0, 0, 5])));
+        assert!(reports[1].seen_by.arp && reports[1].complete);
+        assert_eq!(reports[1].hostname.as_deref(), Some("host-10.0.0.5.lan"));
+        assert_eq!((summary.scanned, summary.online), (1, 1));
+        // The one ARP call is awaited, not repeated.
+        assert_eq!(backend.arp_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_arp_answer_revives_a_host_reported_offline() {
+        // Only ARP answers, and later than the probe timeout (a sleeping phone).
+        let backend = Arc::new(MockBackend {
+            arp_hosts: [ip(5)].into(),
+            arp_delay: TIMEOUT * 2,
+            ..Default::default()
+        });
+        let probes = Arc::new(MockProbes::default());
+        let (updates, summary) = scan_with(backend, Arc::clone(&probes), "10.0.0.5-6", None).await;
+
+        let revived = reports(&updates, ip(5));
+        assert_eq!(revived.len(), 3);
+        assert!(!revived[0].online && revived[0].complete);
+        assert!(revived[1].online && !revived[1].complete && revived[1].seen_by.arp);
+        assert_eq!(revived[1].mac, Some(MacAddr([2, 0, 0, 0, 0, 5])));
+        assert!(revived[2].online && revived[2].complete);
+        assert_eq!(revived[2].hostname.as_deref(), Some("host-10.0.0.5.lan"));
+
+        // The host that never answers is reported once and stays offline.
+        let dead = reports(&updates, ip(6));
+        assert_eq!(dead.len(), 1);
+        assert!(!dead[0].online);
+
+        assert_eq!((summary.scanned, summary.online), (2, 1));
+        assert_eq!(*probes.enriched.lock().unwrap(), [IpAddr::V4(ip(5))]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_report_does_not_wait_for_slow_arp() {
+        let backend = Arc::new(MockBackend {
+            arp_delay: TIMEOUT * 4,
+            ..Default::default()
+        });
+        let (first_report_tx, first_report_rx) = std::sync::mpsc::channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        run_scan(
+            backend,
+            Arc::new(MockProbes::default()),
+            TargetSet::parse("10.0.0.5").unwrap(),
+            ScanConfig {
+                concurrency: 4,
+                timeout: TIMEOUT,
+            },
+            cancel_rx,
+            1,
+            move |_batch: ScanBatch| {
+                let _ = first_report_tx.send(started.elapsed());
+            },
+        )
+        .await;
+        // Reported right after the timeout, although the scan itself waits for ARP.
+        assert!(first_report_rx.recv().unwrap() < TIMEOUT * 3);
+        assert!(started.elapsed() >= TIMEOUT * 4);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -438,19 +769,49 @@ mod tests {
             fail_icmp: true,
             ..Default::default()
         });
-        let (batches, summary) = scan(backend, "10.0.0.5-6", 4, false).await;
+        let (updates, summary) = scan(backend, "10.0.0.5-6").await;
 
         assert_eq!((summary.scanned, summary.online, summary.errors), (2, 1, 2));
-        assert!(host(&batches, ip(5)).online);
+        assert!(host(&updates, ip(5)).online);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn cancelled_scan_stops_early() {
+    async fn scan_cancelled_before_start_probes_nothing() {
         let backend = Arc::new(MockBackend::default());
-        let (batches, summary) = scan(backend, "10.0.0.1-200", 4, true).await;
+        let (updates, summary) = scan_with(
+            backend,
+            Arc::default(),
+            "10.0.0.1-200",
+            Some(Duration::ZERO),
+        )
+        .await;
 
         assert!(summary.cancelled);
         assert_eq!((summary.scanned, summary.total), (0, 200));
-        assert!(batches.is_empty());
+        assert!(updates.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_drops_pending_lookups_quickly() {
+        // Every host is online, enrichment and ARP would take far longer than the test.
+        let backend = Arc::new(MockBackend {
+            icmp_hosts: (2..=200).map(ip).collect(),
+            arp_delay: Duration::from_secs(2),
+            ..Default::default()
+        });
+        let probes = Arc::new(MockProbes {
+            enrich_delay: Duration::from_secs(30),
+            ..Default::default()
+        });
+        let started = Instant::now();
+        let (updates, summary) =
+            scan_with(backend, probes, "10.0.0.2-200", Some(TIMEOUT * 2)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(summary.cancelled);
+        assert!(summary.scanned >= 4 && summary.scanned < 199);
+        assert_eq!(summary.online, summary.scanned);
+        // Hosts were reported, but none got as far as a finished enrichment.
+        assert!(updates.iter().all(|h| h.online && h.hostname.is_none()));
     }
 }

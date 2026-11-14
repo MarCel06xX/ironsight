@@ -68,6 +68,8 @@ pub struct Adapter {
     pub description: String,
     pub mac: Option<MacAddr>,
     pub ipv4: Vec<Ipv4Net>,
+    /// IPv4 DNS servers configured on this adapter.
+    pub dns_servers: Vec<Ipv4Addr>,
     /// Has a default gateway; such adapters are listed first.
     pub has_gateway: bool,
 }
