@@ -1,7 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: only event listening. App commands are validated in Rust.",
+  "description": "Main window: listen to scan events and call the app's own commands. Inputs are validated in Rust.",
   "windows": ["main"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-list-adapters",
+    "allow-start-scan",
+    "allow-stop-scan"
+  ]
 }

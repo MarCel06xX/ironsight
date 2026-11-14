@@ -2,11 +2,23 @@
 :root,
 :root[data-theme="dark"] {
   --bg: #16181d;
+  --bg-raised: #1e2128;
+  --bg-input: #101216;
+  --border: #2e333d;
   --fg: #e6e8ec;
+  --fg-muted: #9aa1ad;
+  --accent: #4c8dff;
+  --accent-fg: #ffffff;
+  --danger: #ff6b6b;
+  color-scheme: dark;
 }
 
 * {
   box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 html,
@@ -18,11 +30,116 @@ body {
 body {
   background: var(--bg);
   color: var(--fg);
-  font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+  font:
+    14px/1.4 "Segoe UI",
+    system-ui,
+    sans-serif;
 }
 
 #app {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   height: 100%;
-  place-items: center;
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+select,
+input,
+button {
+  height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+select {
+  max-width: 320px;
+}
+
+#targets {
+  flex: 1 1 220px;
+  min-width: 160px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+}
+
+button {
+  min-width: 84px;
+  color: var(--accent-fg);
+  background: var(--accent);
+  border-color: var(--accent);
+  cursor: pointer;
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.progress {
+  display: flex;
+  flex: 1 1 260px;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+progress {
+  flex: 1;
+  min-width: 80px;
+  height: 8px;
+  accent-color: var(--accent);
+}
+
+.error {
+  margin: 0;
+  padding: 8px 12px;
+  color: var(--danger);
+  border-bottom: 1px solid var(--border);
+}
+
+.results {
+  flex: 1;
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+th,
+td {
+  padding: 6px 12px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+th {
+  position: sticky;
+  top: 0;
+  font-weight: 600;
+  color: var(--fg-muted);
+  background: var(--bg-raised);
 }

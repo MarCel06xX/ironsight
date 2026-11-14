@@ -1,0 +1,20 @@
+{
+  "adapter.label": "Netzwerkadapter",
+  "adapter.none": "Kein aktiver Adapter gefunden",
+  "scan.targetPlaceholder": "z. B. 192.168.1.0/24, 10.0.0.1-50",
+  "scan.start": "Start",
+  "scan.stop": "Stopp",
+  "scan.progress": "{scanned}/{total} gescannt, {online} online",
+  "scan.status.ready": "Bereit",
+  "scan.status.done": "Fertig",
+  "scan.status.stopped": "Gestoppt",
+  "col.ip": "IP-Adresse",
+  "col.mac": "MAC-Adresse",
+  "col.rtt": "RTT",
+  "col.seenBy": "Erkannt über",
+  "rtt.ms": "{ms} ms",
+  "rtt.subMs": "<1 ms",
+  "seenBy.arp": "ARP",
+  "seenBy.icmp": "ICMP",
+  "seenBy.self": "Dieses Gerät"
+}
