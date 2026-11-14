@@ -1,0 +1,28 @@
+/* Themes are plain CSS custom properties, switched via <html data-theme="…">. */
+:root,
+:root[data-theme="dark"] {
+  --bg: #16181d;
+  --fg: #e6e8ec;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+}
+
+#app {
+  display: grid;
+  height: 100%;
+  place-items: center;
+}

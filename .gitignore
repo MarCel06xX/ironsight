@@ -1,0 +1,23 @@
+# Rust
+target/
+/src-tauri/gen/schemas
+
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Raw IEEE OUI download (converted file is committed, raw CSV is not)
+/tools/oui/*.csv
+
+# Logs
+*.log
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.sw?
