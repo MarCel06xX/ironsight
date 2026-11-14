@@ -7,8 +7,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::CommandError;
 use crate::export::Delimiter;
-use crate::scan::{ConfigError, DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, ScanConfig};
+use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, ScanConfig};
 
 pub const FILE_NAME: &str = "settings.json";
 const MAX_FILE_SIZE: u64 = 64 * 1024;
@@ -44,6 +45,10 @@ pub struct Settings {
     pub timeout_ms: u32,
     /// Last delimiter used for CSV export.
     pub csv_delimiter: Delimiter,
+    /// Look for a new version in the background on every start.
+    pub check_updates: bool,
+    /// Version the user chose to skip in the update dialog.
+    pub skipped_version: Option<String>,
 }
 
 impl Default for Settings {
@@ -54,13 +59,34 @@ impl Default for Settings {
             concurrency: DEFAULT_CONCURRENCY,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             csv_delimiter: Delimiter::Semicolon,
+            check_updates: true,
+            skipped_version: None,
         }
     }
 }
 
+/// Version strings like `1.2.3` or `1.2.3-beta.1`, nothing else.
+fn is_version(value: &str) -> bool {
+    (1..=32).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
 impl Settings {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        ScanConfig::new(self.concurrency, self.timeout_ms).map(drop)
+    pub fn validate(&self) -> Result<(), CommandError> {
+        ScanConfig::new(self.concurrency, self.timeout_ms)?;
+        if self
+            .skipped_version
+            .as_deref()
+            .is_some_and(|v| !is_version(v))
+        {
+            return Err(CommandError::new(
+                "settings.invalid_version",
+                "invalid skipped version",
+            ));
+        }
+        Ok(())
     }
 
     /// Reads the settings file. A missing, oversized or malformed file yields the defaults;
@@ -78,6 +104,13 @@ impl Settings {
         }
         if ScanConfig::new(defaults.concurrency, settings.timeout_ms).is_err() {
             settings.timeout_ms = defaults.timeout_ms;
+        }
+        if settings
+            .skipped_version
+            .as_deref()
+            .is_some_and(|v| !is_version(v))
+        {
+            settings.skipped_version = None;
         }
         settings
     }
@@ -110,6 +143,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::scan::ConfigError;
 
     /// Fresh directory per test inside the system temp dir.
     fn temp_dir(name: &str) -> PathBuf {
@@ -129,6 +163,8 @@ mod tests {
             concurrency: 128,
             timeout_ms: 2500,
             csv_delimiter: Delimiter::Comma,
+            check_updates: false,
+            skipped_version: Some("0.2.0".into()),
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -154,7 +190,9 @@ mod tests {
                 "language": "system",
                 "concurrency": 64,
                 "timeoutMs": 1000,
-                "csvDelimiter": ";"
+                "csvDelimiter": ";",
+                "checkUpdates": true,
+                "skippedVersion": null
             })
         );
     }
@@ -198,6 +236,10 @@ mod tests {
         assert_eq!(loaded.theme, Theme::Purple);
         assert_eq!(loaded.concurrency, DEFAULT_CONCURRENCY);
         assert_eq!(loaded.csv_delimiter, Delimiter::Semicolon);
+        assert!(loaded.check_updates);
+
+        fs::write(&path, r#"{"skippedVersion":"<script>"}"#).unwrap();
+        assert_eq!(Settings::load(&path).skipped_version, None);
 
         fs::write(
             &path,
@@ -214,15 +256,31 @@ mod tests {
     #[test]
     fn validation() {
         assert!(Settings::default().validate().is_ok());
+        let code = |settings: Settings| settings.validate().unwrap_err().code;
         let bad = Settings {
             concurrency: 300,
             ..Settings::default()
         };
-        assert_eq!(bad.validate(), Err(ConfigError::Concurrency));
+        assert_eq!(code(bad), ConfigError::Concurrency.code());
         let bad = Settings {
             timeout_ms: 50,
             ..Settings::default()
         };
-        assert_eq!(bad.validate(), Err(ConfigError::Timeout));
+        assert_eq!(code(bad), ConfigError::Timeout.code());
+
+        for good in ["0.1.2", "1.0.0-beta.1", "2.0.0+build.7"] {
+            let settings = Settings {
+                skipped_version: Some(good.into()),
+                ..Settings::default()
+            };
+            assert!(settings.validate().is_ok(), "{good}");
+        }
+        for bad in ["", "1.0 beta", "../../x", "<b>", &"9".repeat(33)] {
+            let settings = Settings {
+                skipped_version: Some(bad.into()),
+                ..Settings::default()
+            };
+            assert_eq!(code(settings), "settings.invalid_version", "{bad}");
+        }
     }
 }

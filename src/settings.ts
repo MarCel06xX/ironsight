@@ -1,5 +1,5 @@
 // Settings dialog. Values are checked here for quick feedback and again in Rust on save.
-import { type LanguageSetting, type Settings, type ThemeName, saveSettings } from "./api";
+import { type AppInfo, type LanguageSetting, type Settings, type ThemeName, saveSettings } from "./api";
 import { type MessageKey, t } from "./i18n";
 import { THEMES, applyTheme } from "./theme";
 
@@ -49,18 +49,28 @@ export class SettingsDialog {
   private readonly language: HTMLSelectElement;
   private readonly concurrency: HTMLInputElement;
   private readonly timeout: HTMLInputElement;
+  private readonly checkUpdates: HTMLInputElement;
+  private readonly checkNowButton: HTMLButtonElement;
+  private readonly updateStatus: HTMLElement;
   private readonly error: HTMLElement;
 
   constructor(
     private readonly dialog: HTMLDialogElement,
     private readonly onSaved: (settings: Settings) => void,
     private readonly describeError: (error: unknown) => string,
+    private readonly info: AppInfo,
+    /** Runs a manual update check; resolves to a status text ("" if a dialog opened). */
+    private readonly checkNow: () => Promise<string>,
   ) {
     this.theme = query(dialog, "#set-theme");
     this.language = query(dialog, "#set-language");
     this.concurrency = query(dialog, "#set-concurrency");
     this.timeout = query(dialog, "#set-timeout");
     this.error = query(dialog, "#settings-error");
+    this.checkUpdates = query(dialog, "#set-check-updates");
+    this.checkNowButton = query(dialog, "#set-check-now");
+    this.updateStatus = query(dialog, "#set-update-status");
+    this.checkNowButton.addEventListener("click", () => void this.runCheck());
 
     // Live preview; reverted on cancel.
     this.theme.addEventListener("change", () => applyTheme(this.theme.value as ThemeName));
@@ -83,10 +93,29 @@ export class SettingsDialog {
     fillSelect(this.language, LANGUAGES, current.language);
     this.concurrency.value = String(current.concurrency);
     this.timeout.value = String(current.timeoutMs);
+    this.checkUpdates.checked = current.checkUpdates;
+    query(this.dialog, "#set-version").textContent = t(
+      this.info.portable ? "settings.versionPortable" : "settings.version",
+      { version: this.info.version },
+    );
+    this.updateStatus.textContent = "";
+    this.checkNowButton.disabled = false;
     this.concurrency.removeAttribute("aria-invalid");
     this.timeout.removeAttribute("aria-invalid");
     this.error.hidden = true;
     this.dialog.showModal();
+  }
+
+  private async runCheck(): Promise<void> {
+    this.checkNowButton.disabled = true;
+    this.updateStatus.textContent = t("settings.checking");
+    try {
+      this.updateStatus.textContent = await this.checkNow();
+    } catch (error) {
+      this.updateStatus.textContent = t("update.checkFailed", { detail: this.describeError(error) });
+    } finally {
+      this.checkNowButton.disabled = false;
+    }
   }
 
   private cancel(): void {
@@ -113,6 +142,7 @@ export class SettingsDialog {
       language: this.language.value as LanguageSetting,
       concurrency,
       timeoutMs,
+      checkUpdates: this.checkUpdates.checked,
     };
     try {
       await saveSettings(next);

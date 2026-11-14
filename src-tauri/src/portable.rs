@@ -1,41 +1,50 @@
-//! Portable mode: a file named `portable` next to the executable keeps all data (settings and
-//! the WebView2 profile) in a `data/` folder beside it instead of the user's AppData.
+//! Portable build (cargo feature `portable`): a single exe that keeps its settings file and
+//! the WebView2 profile next to itself instead of in AppData.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Marker file name (no extension).
-pub const MARKER: &str = "portable";
-/// Data folder created next to the executable.
-pub const DATA_DIR: &str = "data";
-/// WebView2 user data folder inside the data folder.
-pub const WEBVIEW_DIR: &str = "webview";
+/// Whether this binary was built with the `portable` feature.
+pub const ENABLED: bool = cfg!(feature = "portable");
+/// Settings file next to the portable exe.
+pub const SETTINGS_FILE: &str = "ironsight-settings.json";
+/// WebView2 user data folder next to the portable exe.
+pub const WEBVIEW_DIR: &str = "ironsight-webview";
 
-/// The portable data folder of the running app, if portable mode is active (managed state).
-#[derive(Debug, Clone, Default)]
-pub struct PortableDir(pub Option<PathBuf>);
-
-/// Data folder for the running executable; `None` means "use the normal AppData folders".
-pub fn data_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    data_dir_for(exe.parent()?)
+/// Where a portable build keeps its data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortablePaths {
+    pub settings: PathBuf,
+    pub webview: PathBuf,
 }
 
-/// `<exe_dir>/data` if `<exe_dir>/portable` exists and the data folder can be created and
-/// written to; otherwise `None` (fall back to the app config dir).
-pub fn data_dir_for(exe_dir: &Path) -> Option<PathBuf> {
-    if !exe_dir.join(MARKER).is_file() {
+/// Managed state: `Some` when the running build stores its data next to the exe.
+#[derive(Debug, Clone, Default)]
+pub struct PortableState(pub Option<PortablePaths>);
+
+/// Paths for the running executable; `None` means "use the normal AppData folders".
+pub fn paths() -> Option<PortablePaths> {
+    let exe = std::env::current_exe().ok()?;
+    paths_for(exe.parent()?, ENABLED)
+}
+
+/// Portable paths in `exe_dir`, if this is a portable build and `exe_dir` is writable.
+/// Otherwise `None`: fall back to the app config dir.
+pub fn paths_for(exe_dir: &Path, portable_build: bool) -> Option<PortablePaths> {
+    if !portable_build || !is_writable_dir(exe_dir) {
         return None;
     }
-    let dir = exe_dir.join(DATA_DIR);
-    is_writable_dir(&dir).then_some(dir)
+    Some(PortablePaths {
+        settings: exe_dir.join(SETTINGS_FILE),
+        webview: exe_dir.join(WEBVIEW_DIR),
+    })
 }
 
 fn is_writable_dir(dir: &Path) -> bool {
-    if fs::create_dir_all(dir).is_err() {
+    if !dir.is_dir() {
         return false;
     }
-    let probe = dir.join(format!(".write-test-{}", std::process::id()));
+    let probe = dir.join(format!(".ironsight-write-test-{}", std::process::id()));
     let writable = fs::write(&probe, b"").is_ok();
     let _ = fs::remove_file(&probe);
     writable
@@ -55,44 +64,35 @@ mod tests {
     }
 
     #[test]
-    fn no_marker_means_normal_mode() {
-        let dir = temp_dir("none");
-        assert_eq!(data_dir_for(&dir), None);
-        assert!(
-            !dir.join(DATA_DIR).exists(),
-            "nothing is created without the marker"
+    fn installed_build_uses_app_data() {
+        let dir = temp_dir("installed");
+        assert_eq!(paths_for(&dir, false), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn portable_build_keeps_data_next_to_the_exe() {
+        let dir = temp_dir("portable");
+        assert_eq!(
+            paths_for(&dir, true),
+            Some(PortablePaths {
+                settings: dir.join("ironsight-settings.json"),
+                webview: dir.join("ironsight-webview"),
+            })
         );
+        // The write probe is cleaned up and nothing else is created.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn marker_file_enables_portable_mode() {
-        let dir = temp_dir("marker");
-        fs::write(dir.join(MARKER), b"").unwrap();
-        assert_eq!(data_dir_for(&dir), Some(dir.join(DATA_DIR)));
-        assert!(dir.join(DATA_DIR).is_dir());
-        // The write probe is cleaned up again.
-        assert_eq!(fs::read_dir(dir.join(DATA_DIR)).unwrap().count(), 0);
-        // An existing data folder is reused.
-        assert_eq!(data_dir_for(&dir), Some(dir.join(DATA_DIR)));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn marker_must_be_a_file() {
-        let dir = temp_dir("marker-dir");
-        fs::create_dir(dir.join(MARKER)).unwrap();
-        assert_eq!(data_dir_for(&dir), None);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn unusable_data_folder_falls_back() {
+    fn unwritable_location_falls_back_to_app_data() {
         let dir = temp_dir("blocked");
-        fs::write(dir.join(MARKER), b"").unwrap();
-        // A file where the folder should be: it can neither be created nor written to.
-        fs::write(dir.join(DATA_DIR), b"not a folder").unwrap();
-        assert_eq!(data_dir_for(&dir), None);
+        // A file instead of a folder cannot take the settings file.
+        let not_a_dir = dir.join("ironsight.exe");
+        fs::write(&not_a_dir, b"").unwrap();
+        assert_eq!(paths_for(&not_a_dir, true), None);
+        assert_eq!(paths_for(&dir.join("missing"), true), None);
         fs::remove_dir_all(dir).unwrap();
     }
 }

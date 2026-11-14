@@ -1,10 +1,12 @@
 // Ironsight frontend entry: wires scan controls, results table, details panel, context
 // menu and settings together. Scan results live in memory only.
 import {
+  type AppInfo,
   type HostResult,
   type ScanBatch,
   type ScanSummary,
   type Settings,
+  getAppInfo,
   isCommandError,
   listAdapters,
   loadSettings,
@@ -46,6 +48,7 @@ import { HostStore, type SortKey } from "./store";
 import { type Column, VirtualTable } from "./table";
 import { applyTheme } from "./theme";
 import { Toast } from "./toast";
+import { UpdateDialog, findUpdate } from "./update";
 
 const DEFAULT_SETTINGS: Settings = {
   theme: "dark",
@@ -53,7 +56,11 @@ const DEFAULT_SETTINGS: Settings = {
   concurrency: 64,
   timeoutMs: 1000,
   csvDelimiter: ";",
+  checkUpdates: true,
+  skippedVersion: null,
 };
+/** Delay before the background update check, so the window is shown first. */
+const UPDATE_CHECK_DELAY_MS = 1500;
 /** Minimum time between table refreshes while results stream in. */
 const REFRESH_INTERVAL_MS = 200;
 const FILTER_DELAY_MS = 120;
@@ -428,7 +435,39 @@ onLanguageChange(() => {
   updateDetails(true);
 });
 
-const settingsDialog = new SettingsDialog(byId("settings-dialog"), applySettings, errorText);
+let appInfo: AppInfo = { version: "", portable: false };
+let updateDialog: UpdateDialog | null = null;
+let settingsDialog: SettingsDialog | null = null;
+
+function skipVersion(version: string): void {
+  settings = { ...settings, skippedVersion: version };
+  saveSettings(settings).catch((error: unknown) => console.warn("saving settings failed", error));
+}
+
+/** Manual check from the settings dialog; errors are shown there. */
+async function checkForUpdateNow(): Promise<string> {
+  const update = await findUpdate();
+  if (!update) return t("update.upToDate", { version: appInfo.version });
+  updateDialog?.show(update);
+  return "";
+}
+
+/** Background check on startup: silent on errors and for a skipped version. */
+async function startupUpdateCheck(): Promise<void> {
+  if (!settings.checkUpdates) return;
+  try {
+    const update = await findUpdate();
+    if (!update) {
+      console.info("update check: up to date");
+    } else if (update.version === settings.skippedVersion) {
+      console.info(`update check: ${update.version} is skipped`);
+    } else {
+      updateDialog?.show(update);
+    }
+  } catch (error) {
+    console.warn("update check failed", error);
+  }
+}
 
 const exportDialog = new ExportDialog(
   byId("export-dialog"),
@@ -451,7 +490,7 @@ function wireEvents(): void {
   targetInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !running) void toggleScan();
   });
-  settingsButton.addEventListener("click", () => settingsDialog.open(settings));
+  settingsButton.addEventListener("click", () => settingsDialog?.open(settings));
   exportButton.addEventListener("click", () =>
     exportDialog.open({
       allCount: store.total,
@@ -495,11 +534,27 @@ async function init(): Promise<void> {
   table.setSort(store.sortKey, store.ascending);
   refreshView();
   updateDetails(true);
+
+  appInfo = await getAppInfo();
+  settingsDialog = new SettingsDialog(
+    byId("settings-dialog"),
+    applySettings,
+    errorText,
+    appInfo,
+    checkForUpdateNow,
+  );
+  updateDialog = new UpdateDialog(byId("update-dialog"), appInfo, {
+    isScanning: () => running,
+    stopScan,
+    skip: skipVersion,
+    describeError: errorText,
+  });
   wireEvents();
 
   await onScanBatch(handleBatch);
   await onScanFinished(handleFinished);
   await loadAdapters();
+  window.setTimeout(() => void startupUpdateCheck(), UPDATE_CHECK_DELAY_MS);
 }
 
 init().catch(showError);

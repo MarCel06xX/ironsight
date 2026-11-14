@@ -53,15 +53,24 @@ After each phase: fmt + clippy + tests, commit, push, short summary, **wait for 
 
 Bump the version in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` (+ `Cargo.lock` via
 `cargo check`) and `package.json` (`npm version X.Y.Z --no-git-tag-version`), commit, push, then
-run `.\scripts\release.ps1` (`-NoPublish` = build into `release/` only). It produces installer,
-portable zip and `SHA256SUMS.txt`, tags `vX.Y.Z` and creates the GitHub release.
+run `.\scripts\release.ps1` (`-NoPublish` = build into `release/` only). It builds the portable
+exe, then the NSIS installer + `.sig` (signing key `%USERPROFILE%\.tauri\ironsight.key`, empty
+password; the script only passes the path - never read/print/commit the private key), writes
+`SHA256SUMS.txt` and `latest.json`, tags `vX.Y.Z` and creates a normal (latest) GitHub release.
 
-## Portable mode
+## Portable build and updater
 
-A file `portable` next to the exe -> settings in `<exe dir>/data/`, WebView2 profile in
-`data/webview` (window is created in `lib.rs` setup via `WebviewWindowBuilder::from_config` +
-`data_directory`; config has `create: false`). Falls back to AppData if `data/` is not writable.
-Logic in `portable.rs`. Normal mode: settings `%APPDATA%\<id>\`, WebView2 `%LOCALAPPDATA%\<id>\EBWebView`.
+- Cargo feature `portable` (`npm run tauri build -- --no-bundle --features portable`): settings in
+  `ironsight-settings.json`, WebView2 profile in `ironsight-webview\` next to the exe; AppData if
+  the exe folder is not writable (`portable.rs`). The window is created in `lib.rs` setup via
+  `WebviewWindowBuilder::from_config` + `data_directory` (config window has `create: false`).
+  Installed build: settings `%APPDATA%\<id>\`, WebView2 `%LOCALAPPDATA%\<id>\EBWebView`.
+- Updater: `tauri-plugin-updater` + `tauri-plugin-process`, used from the webview (`src/update.ts`;
+  capabilities `updater:default`, `process:allow-restart`). Endpoint
+  `https://github.com/MarCel06xX/ironsight/releases/latest/download/latest.json`, install mode
+  `passive`, `plugins.updater.pubkey` = content of `ironsight.key.pub`. Startup check 1.5 s after
+  launch, 8 s timeout, silent on errors; settings `checkUpdates` / `skippedVersion`. Portable
+  build (`app_info().portable`) only opens the release page (`open_release_page`).
 
 ## Backend design (phase 1)
 

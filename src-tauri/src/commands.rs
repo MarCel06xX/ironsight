@@ -21,7 +21,7 @@ use crate::export::{
 };
 use crate::mac::MacAddr;
 use crate::platform::{self, Adapter, NetBackend};
-use crate::portable::PortableDir;
+use crate::portable::{self, PortableState};
 use crate::scan::engine::{now_ms, run_scan};
 use crate::scan::range::{MAX_HOSTS, TargetSet};
 use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, HostResult, ScanBatch, ScanConfig};
@@ -246,10 +246,10 @@ pub fn stop_scan(state: State<'_, AppState>) {
     state.cancel_scan();
 }
 
-/// `data/settings.json` next to the exe in portable mode, otherwise in the app config dir.
+/// Next to the exe in the portable build, otherwise in the app config dir.
 fn settings_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
-    if let Some(dir) = &app.state::<PortableDir>().0 {
-        return Ok(dir.join(settings::FILE_NAME));
+    if let Some(paths) = &app.state::<PortableState>().0 {
+        return Ok(paths.settings.clone());
     }
     let dir = app
         .path()
@@ -329,6 +329,31 @@ pub async fn wake_on_lan(
     .map_err(internal)?
     .map(drop)
     .map_err(|e| io_error("action.wol_failed", e))
+}
+
+/// GitHub page of the newest release (opened by the portable build's update dialog).
+const RELEASES_URL: &str = "https://github.com/MarCel06xX/ironsight/releases/latest";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    version: String,
+    /// Portable single-exe build: updates are downloaded manually.
+    portable: bool,
+}
+
+#[tauri::command]
+pub fn app_info(app: AppHandle) -> AppInfo {
+    AppInfo {
+        version: app.package_info().version.to_string(),
+        portable: portable::ENABLED,
+    }
+}
+
+#[tauri::command]
+pub async fn open_release_page() -> Result<(), CommandError> {
+    tauri_plugin_opener::open_url(RELEASES_URL, None::<&str>)
+        .map_err(|e| io_error("action.open_failed", e))
 }
 
 #[derive(Debug, Deserialize)]

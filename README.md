@@ -40,8 +40,13 @@ _Screenshots will follow._
   view.
 - **Themes and languages:** five color themes (dark, light, deep blue, terminal green, purple),
   English and German, switchable without a restart.
-- **Privacy:** no telemetry, no update checks, no network traffic except the scan itself. Scan
-  results are only written to disk when you export them; only the settings are saved.
+- **Updates:** the installed version looks for a new release on startup and, after you confirm,
+  downloads and installs it (update packages are signed and verified). The portable version
+  opens the download page instead.
+- **Privacy:** no telemetry. Besides the scan itself, Ironsight only contacts github.com once per
+  start to check for a new version (it downloads `latest.json`; you can turn this off in the
+  settings). Nothing else is sent. Scan results are only written to disk when you export them;
+  only the settings are saved.
 
 ## Download
 
@@ -50,8 +55,9 @@ Get the files from the [releases page](https://github.com/MarCel06xX/ironsight/r
 | File | Description |
 | --- | --- |
 | `Ironsight_<version>_x64-setup.exe` | **Installer.** Installs for the current user (no administrator rights) with a Start menu entry. Downloads the WebView2 runtime if it is missing. |
-| `Ironsight_<version>_x64-portable.zip` | **Portable.** Unzip anywhere and run `Ironsight.exe`. Because of the included `portable` marker file, settings and the WebView2 profile are stored in a `data` folder next to the exe instead of AppData. |
+| `Ironsight_<version>_x64-portable.exe` | **Portable.** A single exe, no installation. Settings are stored in `ironsight-settings.json` and the WebView2 profile in `ironsight-webview\` next to the exe (in AppData if that folder is not writable). Updates are not installed automatically; the update dialog opens the download page. |
 | `SHA256SUMS.txt` | SHA-256 checksums of both files. |
+| `latest.json`, `*.sig` | Used by the in-app updater. |
 
 Requirements: Windows 10 or 11 (x64) with the Microsoft Edge WebView2 runtime. It is part of
 Windows 11. The portable version does not install it; on Windows 10, get it from
@@ -100,9 +106,11 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Releases are made with `.\scripts\release.ps1`: it checks, builds the installer and the
-portable zip, writes `SHA256SUMS.txt` and publishes a GitHub release for the version in
-`src-tauri/tauri.conf.json` (`-NoPublish` only builds into `release/`).
+Releases are made with `.\scripts\release.ps1`: it runs the checks, builds the portable exe
+(cargo feature `portable`) and the signed installer, writes `SHA256SUMS.txt` and `latest.json`,
+and publishes a GitHub release for the version in `src-tauri/tauri.conf.json` (`-NoPublish`
+only builds into `release/`). It needs the updater signing key at
+`%USERPROFILE%\.tauri\ironsight.key`.
 
 To refresh the vendor table, run `npm run update-oui`. It downloads the IEEE MA-L list and writes
 `src-tauri/data/oui.bin`, which is committed to the repository.
@@ -161,8 +169,11 @@ Informationen zu ihnen an und exportiert die Ergebnisse.
   Wake-on-LAN.
 - **Export** als CSV (für deutsches Excel mit `;`), JSON oder druckbarer HTML-Bericht.
 - **Fünf Farbdesigns**, Deutsch und Englisch, Umschalten ohne Neustart.
-- **Datenschutz:** keine Telemetrie, kein Netzwerkverkehr außer dem Scan. Ergebnisse werden nur
-  beim Export gespeichert.
+- **Updates:** Die installierte Version sucht beim Start nach einer neuen Version und installiert
+  sie nach Bestätigung (signierte Update-Pakete). Die portable Version öffnet die Download-Seite.
+- **Datenschutz:** keine Telemetrie. Außer dem Scan kontaktiert Ironsight nur einmal pro Start
+  github.com, um nach Updates zu suchen (lädt `latest.json`; in den Einstellungen abschaltbar).
+  Sonst wird nichts gesendet. Ergebnisse werden nur beim Export gespeichert.
 
 ### Download
 
@@ -170,8 +181,9 @@ Auf der [Release-Seite](https://github.com/MarCel06xX/ironsight/releases) gibt e
 
 - **Installer** (`…_x64-setup.exe`): Installation für den aktuellen Benutzer, ohne
   Administratorrechte. Lädt die WebView2 Runtime nach, falls sie fehlt.
-- **Portable** (`…_x64-portable.zip`): entpacken und `Ironsight.exe` starten. Einstellungen und
-  WebView2-Profil liegen im Ordner `data` neben der exe statt in AppData.
+- **Portable** (`…_x64-portable.exe`): eine einzelne exe ohne Installation. Einstellungen liegen in
+  `ironsight-settings.json`, das WebView2-Profil in `ironsight-webview\` neben der exe (in AppData,
+  falls der Ordner nicht beschreibbar ist).
 - **`SHA256SUMS.txt`** mit den Prüfsummen.
 
 Voraussetzung ist Windows 10/11 (x64) mit der Microsoft Edge WebView2 Runtime (in Windows 11

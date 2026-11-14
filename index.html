@@ -115,6 +115,26 @@
       </form>
     </dialog>
 
+    <dialog id="update-dialog" aria-labelledby="update-title">
+      <h2 id="update-title" data-i18n="update.title"></h2>
+      <p id="update-text"></p>
+      <div id="update-notes-block">
+        <h3 data-i18n="update.notes"></h3>
+        <div id="update-notes" class="update-notes"></div>
+      </div>
+      <p id="update-hint" class="note" hidden></p>
+      <div id="update-progress-block" class="update-progress" hidden>
+        <progress id="update-progress"></progress>
+        <span id="update-progress-text" class="muted"></span>
+      </div>
+      <p id="update-error" class="error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button id="update-skip" type="button" data-i18n="update.skip"></button>
+        <button id="update-later" type="button" data-i18n="update.later"></button>
+        <button id="update-install" type="button" class="primary"></button>
+      </div>
+    </dialog>
+
     <dialog id="settings-dialog" aria-labelledby="settings-title">
       <form id="settings-form" method="dialog" novalidate>
         <h2 id="settings-title" data-i18n="settings.title"></h2>
@@ -136,6 +156,18 @@
           <input id="set-timeout" type="number" min="100" max="10000" step="1" required />
           <small data-i18n="settings.timeoutHint"></small>
         </label>
+        <fieldset class="field">
+          <legend data-i18n="settings.updates"></legend>
+          <label class="checkbox">
+            <input id="set-check-updates" type="checkbox" />
+            <span data-i18n="settings.checkUpdates"></span>
+          </label>
+          <div class="update-row">
+            <button id="set-check-now" type="button" data-i18n="settings.checkNow"></button>
+            <span id="set-version" class="muted"></span>
+          </div>
+          <small id="set-update-status" class="muted" aria-live="polite"></small>
+        </fieldset>
         <p id="settings-error" class="error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button id="settings-cancel" type="button" data-i18n="settings.cancel"></button>

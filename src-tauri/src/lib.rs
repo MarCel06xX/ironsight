@@ -12,18 +12,19 @@ mod scan;
 mod settings;
 
 pub fn run() {
-    let portable_dir = portable::data_dir();
-    let webview_dir = portable_dir
-        .as_ref()
-        .map(|dir| dir.join(portable::WEBVIEW_DIR));
+    let portable_paths = portable::paths();
+    let webview_dir = portable_paths.as_ref().map(|paths| paths.webview.clone());
     tauri::Builder::default()
         // Used from Rust only (save dialog for exports); the webview gets no dialog permission.
         .plugin(tauri_plugin_dialog::init())
+        // Update check/install from the webview (`updater:default`) and restart afterwards.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(commands::AppState::new(platform::default_backend()))
-        .manage(portable::PortableDir(portable_dir))
+        .manage(portable::PortableState(portable_paths))
         .setup(move |app| {
             // The window is declared in tauri.conf.json with `create: false` and built here,
-            // so portable mode can move the WebView2 profile next to the executable.
+            // so the portable build can keep the WebView2 profile next to the executable.
             let config = app
                 .config()
                 .app
@@ -50,6 +51,8 @@ pub fn run() {
             commands::open_file_share,
             commands::wake_on_lan,
             commands::export_results,
+            commands::app_info,
+            commands::open_release_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

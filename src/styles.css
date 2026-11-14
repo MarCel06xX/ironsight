@@ -583,6 +583,47 @@ dialog .error {
   padding: 0 0 12px;
 }
 
+.update-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 6px 0 4px;
+}
+
+dialog h3 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+
+.update-notes {
+  max-height: 220px;
+  padding: 8px 10px;
+  overflow: auto;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.update-progress progress {
+  flex: 1;
+}
+
+#update-skip {
+  margin-right: auto;
+}
+
 .dialog-actions {
   display: flex;
   justify-content: flex-end;

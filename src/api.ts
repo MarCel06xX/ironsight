@@ -102,6 +102,16 @@ export interface Settings {
   timeoutMs: number;
   /** Last delimiter used for CSV export. */
   csvDelimiter: CsvDelimiter;
+  /** Look for a new version in the background on every start. */
+  checkUpdates: boolean;
+  /** Version the user chose to skip in the update dialog. */
+  skippedVersion: string | null;
+}
+
+export interface AppInfo {
+  version: string;
+  /** Portable single-exe build: updates are downloaded manually. */
+  portable: boolean;
 }
 
 export interface ExportRequest {
@@ -153,6 +163,11 @@ export const wakeOnLan = (mac: string, ip: string | null): Promise<void> =>
 /** Shows the save dialog and writes the file; resolves to its path, or `null` if cancelled. */
 export const exportResults = (request: ExportRequest): Promise<string | null> =>
   invoke("export_results", { request });
+
+export const getAppInfo = (): Promise<AppInfo> => invoke("app_info");
+
+/** Opens the GitHub page of the newest release in the browser. */
+export const openReleasePage = (): Promise<void> => invoke("open_release_page");
 
 export const onScanBatch = (handler: (batch: ScanBatch) => void): Promise<UnlistenFn> =>
   listen<ScanBatch>("scan:batch", (event) => handler(event.payload));
