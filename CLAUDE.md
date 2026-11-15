@@ -57,6 +57,10 @@ run `.\scripts\release.ps1` (`-NoPublish` = build into `release/` only). It buil
 exe, then the NSIS installer + `.sig` (signing key `%USERPROFILE%\.tauri\ironsight.key`, empty
 password; the script only passes the path - never read/print/commit the private key), writes
 `SHA256SUMS.txt` and `latest.json`, tags `vX.Y.Z` and creates a normal (latest) GitHub release.
+New key only via `npx tauri signer generate --ci --force -w "$env:USERPROFILE\.tauri\ironsight.key"`:
+the interactive prompt stored a non-empty password once (signing then fails with "Wrong password").
+A new key needs the new `.pub` content in `plugins.updater.pubkey` - and installed apps with the old key
+can no longer update.
 
 ## Portable build and updater
 
