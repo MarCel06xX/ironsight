@@ -186,7 +186,7 @@ where
 }
 
 /// Resolves once the scan is cancelled (never, if the sender is gone).
-async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+pub(crate) async fn cancelled(cancel: &mut watch::Receiver<bool>) {
     if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
         std::future::pending::<()>().await;
     }

@@ -179,6 +179,19 @@ pub fn open_file_share(ip: IpAddr) -> Result<(), LaunchError> {
     return unsupported::open_file_share(ip);
 }
 
+/// Tunes a TCP socket for a port probe; call before `connect`. On Windows this makes a
+/// refused connection fail at once and the OS wait exactly `timeout` for an answer (see
+/// `windows::prepare_probe_socket`).
+pub fn prepare_probe_socket(
+    socket: &tokio::net::TcpSocket,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    return windows::prepare_probe_socket(socket, timeout);
+    #[cfg(not(windows))]
+    return unsupported::prepare_probe_socket(socket, timeout);
+}
+
 pub fn default_backend() -> Arc<dyn NetBackend> {
     #[cfg(windows)]
     return Arc::new(windows::WindowsBackend);

@@ -9,6 +9,9 @@ mod known;
 mod mac;
 mod platform;
 mod portable;
+// Not wired into the commands yet (port scan phase 2).
+#[allow(dead_code)]
+mod ports;
 mod scan;
 mod settings;
 

@@ -33,3 +33,11 @@ pub fn open_remote_desktop(_ip: IpAddr) -> Result<(), LaunchError> {
 pub fn open_file_share(_ip: IpAddr) -> Result<(), LaunchError> {
     Err(LaunchError::Unsupported)
 }
+
+/// Nothing to tune yet; the probe's own timeout applies.
+pub fn prepare_probe_socket(
+    _socket: &tokio::net::TcpSocket,
+    _timeout: Duration,
+) -> std::io::Result<()> {
+    Ok(())
+}

@@ -1,8 +1,10 @@
 //! Windows backend on top of the IP Helper API. Needs neither admin rights nor Npcap.
 
 use std::ffi::OsString;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::io::AsRawSocket;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -16,8 +18,10 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows::Win32::Networking::WinSock::{
-    ADDRESS_FAMILY, NL_NEIGHBOR_STATE, NlnsDelay, NlnsIncomplete, NlnsPermanent, NlnsProbe,
-    NlnsReachable, NlnsStale, NlnsUnreachable, SOCKADDR_IN, SOCKET_ADDRESS,
+    ADDRESS_FAMILY, IPPROTO_TCP, NL_NEIGHBOR_STATE, NlnsDelay, NlnsIncomplete, NlnsPermanent,
+    NlnsProbe, NlnsReachable, NlnsStale, NlnsUnreachable, SIO_TCP_INITIAL_RTO, SOCKADDR_IN, SOCKET,
+    SOCKET_ADDRESS, TCP_FAIL_CONNECT_ON_ICMP_ERROR, TCP_INITIAL_RTO_PARAMETERS, WSAGetLastError,
+    WSAIoctl, setsockopt,
 };
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 
@@ -259,6 +263,83 @@ fn neighbor_state(state: NL_NEIGHBOR_STATE) -> NeighborState {
         .map_or(NeighborState::Unknown, |(_, mapped)| mapped)
 }
 
+/// `TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS` from mstcpip.h, `(UCHAR)-2`. The `windows` crate
+/// declares it as `u16` (65534), but the field it goes into is a `u8`.
+const NO_SYN_RETRANSMISSIONS: u8 = 0xFE;
+
+/// Tunes a TCP socket for a port probe; call before `connect`.
+///
+/// - No SYN retransmissions (`SIO_TCP_INITIAL_RTO`). By default Windows answers an RST to its
+///   SYN by sending the SYN again, so connecting to a closed port takes about 2 s (measured on
+///   Windows 11: 2.03 s on loopback, on the own LAN address and against a LAN router) and looks
+///   filtered with any shorter timeout. Without retransmissions the RST is reported at once
+///   (< 2 ms in the same measurement).
+/// - Initial RTO = `timeout`. Without retransmissions the OS gives up after the initial RTO
+///   (1 s by default) with `WSAETIMEDOUT`; this makes it wait exactly as long as the probe
+///   should (measured: 300 ms -> 0.31 s, 3000 ms -> 3.0 s). Trade-off: a single lost SYN makes
+///   a port look filtered.
+/// - `TCP_FAIL_CONNECT_ON_ICMP_ERROR` (Windows 10 1903+, best effort): fail as soon as an ICMP
+///   "unreachable" arrives instead of waiting for the timeout.
+pub fn prepare_probe_socket(socket: &impl AsRawSocket, timeout: Duration) -> io::Result<()> {
+    let socket = SOCKET(socket.as_raw_socket() as usize);
+    // 0 would mean "system default".
+    let rtt_ms = u16::try_from(timeout.as_millis())
+        .unwrap_or(u16::MAX)
+        .max(1);
+    set_initial_rto(socket, rtt_ms, NO_SYN_RETRANSMISSIONS)?;
+    let _ = fail_connect_on_icmp_error(socket);
+    Ok(())
+}
+
+fn set_initial_rto(socket: SOCKET, rtt_ms: u16, max_syn_retransmissions: u8) -> io::Result<()> {
+    let params = TCP_INITIAL_RTO_PARAMETERS {
+        Rtt: rtt_ms,
+        MaxSynRetransmissions: max_syn_retransmissions,
+    };
+    let mut returned = 0u32;
+    // SAFETY: `params` is a valid input buffer of the given size for this control code;
+    // there is no output buffer and no overlapped I/O.
+    let rc = unsafe {
+        WSAIoctl(
+            socket,
+            SIO_TCP_INITIAL_RTO,
+            Some(std::ptr::from_ref(&params).cast()),
+            size_of::<TCP_INITIAL_RTO_PARAMETERS>() as u32,
+            None,
+            0,
+            &mut returned,
+            None,
+            None,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(last_socket_error()),
+    }
+}
+
+fn fail_connect_on_icmp_error(socket: SOCKET) -> io::Result<()> {
+    let on = 1u32.to_ne_bytes();
+    // SAFETY: plain setsockopt with a 4-byte DWORD value.
+    let rc = unsafe {
+        setsockopt(
+            socket,
+            IPPROTO_TCP.0,
+            TCP_FAIL_CONNECT_ON_ICMP_ERROR,
+            Some(&on),
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(last_socket_error()),
+    }
+}
+
+fn last_socket_error() -> io::Error {
+    // SAFETY: no preconditions.
+    io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0)
+}
+
 /// Closes the ICMP handle on drop.
 struct IcmpHandle(HANDLE);
 
@@ -478,6 +559,26 @@ mod tests {
     fn reads_neighbor_cache_without_error() {
         for neighbor in WindowsBackend.neighbor_cache().unwrap() {
             assert!(!neighbor.mac.is_zero());
+        }
+    }
+
+    #[test]
+    fn no_syn_retransmissions_matches_the_sdk_value() {
+        use windows::Win32::Networking::WinSock::TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS;
+        assert_eq!(
+            TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS as u8,
+            NO_SYN_RETRANSMISSIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_sockets_accept_the_tuning() {
+        for socket in [
+            tokio::net::TcpSocket::new_v4().unwrap(),
+            tokio::net::TcpSocket::new_v6().unwrap(),
+        ] {
+            prepare_probe_socket(&socket, Duration::from_millis(100)).unwrap();
+            prepare_probe_socket(&socket, Duration::from_secs(600)).unwrap();
         }
     }
 

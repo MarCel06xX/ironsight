@@ -8,8 +8,16 @@ Windows only. Port scanning / packet capture / Linux come later – keep platfor
 
 **v0.2.0 released** (offline devices, known devices, three states). Released: v0.1.0-v0.1.3, v0.2.0;
 the updater was tested end to end (0.1.2 -> 0.1.3). Releases only after the user's OK.
-Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), port
-scanning, packet capture, Linux backend.
+
+**In progress: TCP port scanner, to be released as v0.4.0** (user's version number), in 5 phases;
+commit + push after each phase, then stop and wait for the user's go.
+- Phase 1 (backend engine) **done**: `ports/` module, see "Port scanning" below.
+- Next: phase 2 banner grabbing + pipeline integration (Tauri events, replace the fixed 9-port
+  probe), phase 3 UI, phase 4 export/import (`schema_version` 3, fixtures for 1 and 2), phase 5
+  README/CHANGELOG/version bump (do NOT run `scripts/release.ps1`).
+
+Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), packet
+capture, Linux backend.
 
 ## Rules
 
@@ -175,12 +183,58 @@ can no longer update.
   import/forget (`KnownUpdate.hosts`) and in exports. Lock order: `known` before `last_scan`.
 - `save_settings`: remember on -> write file, off -> delete it.
 
+## Port scanning (v0.4.0, `src-tauri/src/ports/`)
+
+TCP connect scan only: no Npcap, no admin rights, no raw sockets. Tauri-free like the scan
+engine; `mod ports` has `#[allow(dead_code)]` in `lib.rs` until phase 2 wires it into commands.
+- `spec.rs` `PortSet` = merged inclusive `u16` ranges. Input: comma list of `N` / `A-B`,
+  whitespace around entries and `-` allowed; strict otherwise: no empty entries (`22,,80`,
+  trailing comma), ASCII digits only, no leading zeros, 1-65535, no open ranges, max 2048 bytes.
+  Duplicates/overlaps are merged, so the normalized set never holds a port twice; `Display` gives
+  the normalized spec (`22,80,443,1000-2000`). Errors `ports.*` with `code()`/`detail()`.
+- `presets.rs` own curation (no nmap-services or other port databases - license): Common (22
+  ports, contains the old 9 probe ports), Top 100 (grouped list), Top 1000 = Top 100 + every port
+  of `names.rs` + remaining well-known ports 1-1023 from the lowest up to exactly 1000, All.
+  Serde names `common`/`top100`/`top1000`/`all`.
+- `names.rs` port -> service name, display only (IANA name, or the common one: 445 `smb`, 3389
+  `rdp`, 8080 `http-alt`); the table is also the curated Top 1000 extension list.
+- `probe.rs` one connect: open / closed (`ConnectionRefused`/`Reset`) / filtered (`TimedOut`,
+  host/net unreachable) / failed (local error, counted as `errors`, never shown as a state).
+  One retry after 100 ms on `AddrInUse`/`WSAENOBUFS`. Own address port 137 gives `WSAEACCES`
+  (Windows blocks it) -> error, correct.
+- **Windows SYN retry after RST** (measured, Win 11): a plain connect to a closed port takes
+  2.03 s (loopback, own LAN address and LAN router alike) - with a 1 s timeout every closed port
+  would look filtered. Fix in `platform::windows::prepare_probe_socket` before `connect`:
+  `SIO_TCP_INITIAL_RTO` with `MaxSynRetransmissions = 0xFE` (no retransmissions; the windows
+  crate declares the constant as u16 65534, the field is u8) -> RST reported in < 2 ms; and
+  `Rtt = probe timeout`, because without retransmissions the OS gives up after the initial RTO
+  (default 1 s; measured 300 ms -> 0.31 s, 3000 -> 3.0 s). Trade-off: one lost SYN = filtered.
+  Plus best-effort `TCP_FAIL_CONNECT_ON_ICMP_ERROR`. Needs windows feature `Win32_System_IO`
+  (for `WSAIoctl`). tokio timeout = probe timeout + 250 ms backstop only.
+- **TIME_WAIT**: `TcpSocket::set_zero_linger()` (SO_LINGER 0) -> closing an open port sends RST,
+  no TIME_WAIT (verified: Top 1000 on the router with 10 open ports left 0 entries, one plain
+  connect+close leaves 1). Ephemeral range is 16,384 ports. Don't use deprecated `set_linger`.
+- `scanner.rs` `scan_ports(prober, hosts, ports, config, cancel, scan_id, on_batch)`:
+  `PortProber` trait (real `TcpProber`, tests use a mock). Limits: timeout 100-10,000 ms (1000),
+  concurrency 1-1024 (256, global semaphore), per host 1-256 (32, clamped to concurrency and port
+  count); hosts in parallel = ceil(concurrency / per host) so hosts finish one after another.
+  Cap hosts x ports: default 1,000,000 (a /24 with Top 1000 fits), configurable up to 2^24;
+  above it the scan is refused (`ports.too_many_probes`), never truncated. Cancel (existing
+  `watch` channel) aborts in-flight probes (drop = socket closed), stopped hosts are reported
+  `complete: false`.
+- Live results: `PortBatch { scanId, hosts: HostPorts[], done, total }` every 250 ms or 256 changed
+  hosts; `HostPorts` is an upsert by IP (`complete`, `probed/total`, counts `open/closed/
+  filtered/errors`, `ports[]` = open ports up to 1024 + closed/filtered ports while <= 32 of that
+  state, like "997 closed"). `PortScanSummary` at the end.
+
 ## Commands
 
 ```
 npm run typecheck                                   # tsc strict
 cd src-tauri && cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 cargo test live_scan -- --ignored --nocapture       # real scan of the local /24 (manual)
+cargo test connect_timing -- --ignored --nocapture  # plain vs tuned connect to a closed port
+cargo test live_port_scan -- --ignored --nocapture  # Top 1000 on own address (IRONSIGHT_PORTS_HOST=<ip>)
 npm run update-oui                                  # refresh the embedded IEEE OUI table
 npm run tauri dev                                   # user runs this
 ```
