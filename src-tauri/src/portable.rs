@@ -10,12 +10,15 @@ pub const ENABLED: bool = cfg!(feature = "portable");
 pub const SETTINGS_FILE: &str = "ironsight-settings.json";
 /// WebView2 user data folder next to the portable exe.
 pub const WEBVIEW_DIR: &str = "ironsight-webview";
+/// Remembered devices (opt-in) next to the portable exe.
+pub const KNOWN_DEVICES_FILE: &str = "ironsight-known-devices.json";
 
 /// Where a portable build keeps its data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePaths {
     pub settings: PathBuf,
     pub webview: PathBuf,
+    pub known_devices: PathBuf,
 }
 
 /// Managed state: `Some` when the running build stores its data next to the exe.
@@ -37,6 +40,7 @@ pub fn paths_for(exe_dir: &Path, portable_build: bool) -> Option<PortablePaths> 
     Some(PortablePaths {
         settings: exe_dir.join(SETTINGS_FILE),
         webview: exe_dir.join(WEBVIEW_DIR),
+        known_devices: exe_dir.join(KNOWN_DEVICES_FILE),
     })
 }
 
@@ -78,6 +82,7 @@ mod tests {
             Some(PortablePaths {
                 settings: dir.join("ironsight-settings.json"),
                 webview: dir.join("ironsight-webview"),
+                known_devices: dir.join("ironsight-known-devices.json"),
             })
         );
         // The write probe is cleaned up and nothing else is created.

@@ -5,6 +5,7 @@ mod commands;
 mod enrich;
 mod error;
 mod export;
+mod known;
 mod mac;
 mod platform;
 mod portable;
@@ -38,6 +39,7 @@ pub fn run() {
                 window = window.data_directory(dir.clone());
             }
             window.build()?;
+            commands::init_known_devices(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -53,6 +55,8 @@ pub fn run() {
             commands::export_results,
             commands::app_info,
             commands::open_release_page,
+            commands::import_scan,
+            commands::forget_known_devices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

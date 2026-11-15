@@ -5,7 +5,9 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 
 use super::labels::Labels;
-use super::{Delimiter, seen_by_text, services_text, source_key, status_key, time, web_info};
+use super::{
+    Delimiter, seen_by_text, services_text, source_key, sources_text, status_key, time, web_info,
+};
 use crate::scan::HostResult;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -93,6 +95,8 @@ pub fn write_csv(
         "export.col.httpServer",
         "details.seenBy",
         "details.lastSeen",
+        "col.lastSeen",
+        "export.col.source",
     ]
     .map(|key| trusted(labels.get(key)));
     write_row(out, &header, delimiter)?;
@@ -125,6 +129,12 @@ pub fn write_csv(
             untrusted(server),
             trusted(seen_by_text(host, labels)),
             trusted(time::rfc3339(host.timestamp_ms, utc_offset_minutes)),
+            trusted(
+                host.last_seen_ms
+                    .map(|ms| time::rfc3339(ms, utc_offset_minutes))
+                    .unwrap_or_default(),
+            ),
+            trusted(sources_text(host, labels)),
         ];
         write_row(out, &row, delimiter)?;
     }
@@ -184,13 +194,17 @@ mod tests {
         );
         assert_eq!(lines[3], "");
         assert!(lines[0].starts_with("Status;IP address;Hostname;Hostname source;"));
-        assert_eq!(lines[0].split(';').count(), 17);
+        assert_eq!(lines[0].split(';').count(), 19);
+        assert!(lines[0].ends_with(";Last seen;Data source"), "{}", lines[0]);
 
         let router = lines[1];
         assert!(router.starts_with("Online;192.168.1.1;fritz.box;DNS;fritz.box;;FRITZ;"));
         assert!(router.contains(";no;"), "{router}");
         assert!(router.contains(";80 http, 443 https;"), "{router}");
-        assert!(router.contains(";2025-11-14T19:30:00+01:00"), "{router}");
+        assert!(
+            router.contains(";2025-11-14T19:30:00+01:00;2025-11-14T19:30:00+01:00;live"),
+            "{router}"
+        );
         // The malicious title is quoted, its quotes doubled and the formula guarded.
         assert!(
             router.contains(";\"'=cmd|' /C calc'!A0 \"\"<b>\";"),
@@ -198,7 +212,7 @@ mod tests {
         );
 
         assert!(
-            lines[2].starts_with("Offline;192.168.1.2;;;;;;;;;;;;;;;"),
+            lines[2].starts_with("Unused;192.168.1.2;;;;;;;;;;;;;;;"),
             "{}",
             lines[2]
         );

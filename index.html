@@ -59,11 +59,23 @@
           data-i18n-placeholder="filter.placeholder"
           data-i18n-aria-label="filter.label"
         />
-        <label class="checkbox">
-          <input id="only-online" type="checkbox" checked />
-          <span data-i18n="filter.onlineOnly"></span>
-        </label>
+        <div class="status-filter" role="group" data-i18n-aria-label="filter.show">
+          <span class="muted" data-i18n="filter.show"></span>
+          <label class="checkbox">
+            <input id="show-online" type="checkbox" />
+            <span data-i18n="status.online"></span>
+          </label>
+          <label class="checkbox">
+            <input id="show-offline" type="checkbox" />
+            <span data-i18n="status.offline"></span>
+          </label>
+          <label class="checkbox">
+            <input id="show-unused" type="checkbox" />
+            <span data-i18n="status.unused"></span>
+          </label>
+        </div>
         <span id="shown-count" class="muted"></span>
+        <button id="import-btn" type="button" data-i18n="import.open"></button>
         <button id="export-btn" type="button" data-i18n="export.open" disabled></button>
       </div>
       <div class="workspace">
@@ -156,6 +168,21 @@
           <input id="set-timeout" type="number" min="100" max="10000" step="1" required />
           <small data-i18n="settings.timeoutHint"></small>
         </label>
+        <fieldset class="field">
+          <legend data-i18n="settings.offlineDevices"></legend>
+          <label class="field">
+            <span data-i18n="settings.offlineNames"></span>
+            <select id="set-offline-names"></select>
+          </label>
+          <label class="checkbox">
+            <input id="set-remember" type="checkbox" />
+            <span data-i18n="settings.rememberDevices"></span>
+          </label>
+          <small class="muted block" data-i18n="settings.rememberHint"></small>
+          <div class="update-row">
+            <button id="set-forget" type="button" data-i18n="settings.forgetDevices"></button>
+          </div>
+        </fieldset>
         <fieldset class="field">
           <legend data-i18n="settings.updates"></legend>
           <label class="checkbox">

@@ -8,9 +8,12 @@ use serde::Serialize;
 
 use super::{ExportOptions, ScanInfo, Scope, time};
 use crate::mac::MacAddr;
-use crate::scan::{HostNames, HostResult, NameSource, SeenBy, ServiceInfo};
+use crate::scan::{
+    FieldSources, HostNames, HostResult, HostStatus, NameSource, SeenBy, ServiceInfo,
+};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// 2: hosts have `status`, `last_seen` and `sources`.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 struct Document<'a> {
@@ -47,6 +50,11 @@ struct Scan<'a> {
 struct Host<'a> {
     ip: IpAddr,
     online: bool,
+    status: HostStatus,
+    /// When the device was last seen online (UTC); `null` if unknown.
+    last_seen: Option<String>,
+    /// Where each field came from: live, dns, arpCache, remembered, imported.
+    sources: FieldSources,
     hostname: Option<&'a str>,
     hostname_source: Option<NameSource>,
     names: &'a HostNames,
@@ -94,6 +102,9 @@ pub fn write_json(
             .map(|host| Host {
                 ip: host.ip,
                 online: host.online,
+                status: host.status,
+                last_seen: host.last_seen_ms.map(|ms| time::rfc3339(ms, 0)),
+                sources: host.sources,
                 hostname: host.hostname.as_deref(),
                 hostname_source: host.hostname_source,
                 names: &host.names,
@@ -127,7 +138,7 @@ mod tests {
         write_json(&mut out, &sample_info(), &sample_hosts(), &options).unwrap();
         let doc: Value = serde_json::from_str(&utf8(&out)).unwrap();
 
-        assert_eq!(doc["schema_version"], 1);
+        assert_eq!(doc["schema_version"], 2);
         assert_eq!(doc["generator"]["name"], "Ironsight");
         assert_eq!(doc["generator"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(doc["scope"], "all");
@@ -168,8 +179,15 @@ mod tests {
         assert_eq!(router["services"][1]["http"], Value::Null);
         assert_eq!(router["last_update"], "2025-11-14T18:30:00Z");
 
+        assert_eq!(router["status"], "online");
+        assert_eq!(router["last_seen"], "2025-11-14T18:30:00Z");
+        assert_eq!(router["sources"]["hostname"], "live");
+        assert_eq!(router["sources"]["workgroup"], Value::Null);
+
         let offline = &doc["hosts"][1];
         assert_eq!(offline["online"], false);
+        assert_eq!(offline["status"], "unused");
+        assert_eq!(offline["last_seen"], Value::Null);
         assert_eq!(offline["hostname"], Value::Null);
         assert_eq!(offline["services"], json!([]));
     }

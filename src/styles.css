@@ -3,8 +3,8 @@
 :root {
   --row-height: 28px; /* keep in sync with ROW_HEIGHT in table.ts */
   --vt-columns: 96px 130px minmax(160px, 1.4fr) 150px minmax(140px, 1fr) 72px
-    minmax(120px, 1fr) minmax(140px, 1fr) 120px;
-  --vt-min-width: 1130px;
+    minmax(120px, 1fr) minmax(140px, 1fr) 120px 120px;
+  --vt-min-width: 1250px;
 }
 
 :root,
@@ -263,8 +263,20 @@ progress {
   border-bottom: 1px solid var(--border);
 }
 
-#export-btn {
+#import-btn {
   margin-left: auto;
+}
+
+.status-filter {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+small.block {
+  display: block;
+  margin: 2px 0 6px;
 }
 
 #filter {
@@ -382,6 +394,11 @@ progress {
   color: var(--fg-muted);
 }
 
+.vt-row.unused {
+  color: var(--fg-muted);
+  opacity: 0.55;
+}
+
 .vt-cell {
   padding: 0 10px;
   overflow: hidden;
@@ -408,6 +425,11 @@ progress {
 
 .dot.online {
   background: var(--online);
+}
+
+.dot.unused {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--offline);
 }
 
 .dot.pending {

@@ -19,12 +19,16 @@ use crate::error::CommandError;
 use crate::export::{
     self, Delimiter, ExportKind, ExportOptions, Labels, ReportLanguage, ScanInfo, Scope,
 };
+use crate::known::{self, KnownDevices, LiveSet};
 use crate::mac::MacAddr;
 use crate::platform::{self, Adapter, NetBackend};
 use crate::portable::{self, PortableState};
 use crate::scan::engine::{now_ms, run_scan};
 use crate::scan::range::{MAX_HOSTS, TargetSet};
-use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, HostResult, ScanBatch, ScanConfig};
+use crate::scan::{
+    DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, DataSource, HostResult, OfflineNames, ScanBatch,
+    ScanConfig,
+};
 use crate::settings::{self, Settings};
 
 pub const EVENT_SCAN_BATCH: &str = "scan:batch";
@@ -39,16 +43,66 @@ struct ActiveScan {
 struct ScanRecord {
     scan_id: u64,
     info: ScanInfo,
+    /// Hosts as the scan found them (without known-device data).
     hosts: HashMap<IpAddr, HostResult>,
+    live: LiveSet,
+    /// Silent addresses currently shown with known-device data.
+    known_applied: HashSet<IpAddr>,
 }
 
 impl ScanRecord {
+    fn new(scan_id: u64, info: ScanInfo) -> Self {
+        Self {
+            scan_id,
+            info,
+            hosts: HashMap::new(),
+            live: LiveSet::default(),
+            known_applied: HashSet::new(),
+        }
+    }
+
+    fn add(&mut self, host: HostResult) {
+        self.live.add(&host);
+        self.hosts.insert(host.ip, host);
+    }
+
+    /// The host as shown: silent addresses get known-device data.
+    fn effective(&self, host: &HostResult, known: &KnownDevices) -> HostResult {
+        if host.online {
+            return host.clone();
+        }
+        // A MAC on a silent address can only come from the neighbor cache.
+        let cache_mac = host
+            .mac
+            .filter(|_| host.sources.mac == Some(DataSource::ArpCache));
+        known::apply_known(host, known.find(host.ip, cache_mac, &self.live))
+    }
+
+    /// Recomputes known-device data for all silent addresses and returns the rows to send:
+    /// all with known data plus those that just lost it.
+    fn refresh_known(&mut self, known: &KnownDevices) -> Vec<HostResult> {
+        let mut changed = Vec::new();
+        let mut applied = HashSet::new();
+        for host in self.hosts.values().filter(|h| !h.online) {
+            let shown = self.effective(host, known);
+            if shown != *host {
+                applied.insert(host.ip);
+                changed.push(shown);
+            } else if self.known_applied.contains(&host.ip) {
+                changed.push(shown);
+            }
+        }
+        self.known_applied = applied;
+        changed.sort_by_key(|host| host.ip);
+        changed
+    }
+
     /// All hosts sorted by address, or the given addresses in their order (unknown and
-    /// repeated addresses are skipped).
-    fn select(&self, ips: Option<&[IpAddr]>) -> Vec<HostResult> {
-        match ips {
+    /// repeated addresses are skipped), as shown in the app.
+    fn select(&self, ips: Option<&[IpAddr]>, known: &KnownDevices) -> Vec<HostResult> {
+        let hosts: Vec<&HostResult> = match ips {
             None => {
-                let mut hosts: Vec<HostResult> = self.hosts.values().cloned().collect();
+                let mut hosts: Vec<&HostResult> = self.hosts.values().collect();
                 hosts.sort_by_key(|host| host.ip);
                 hosts
             }
@@ -56,10 +110,30 @@ impl ScanRecord {
                 let mut seen = HashSet::new();
                 ips.iter()
                     .filter(|ip| seen.insert(**ip))
-                    .filter_map(|ip| self.hosts.get(ip).cloned())
+                    .filter_map(|ip| self.hosts.get(ip))
                     .collect()
             }
-        }
+        };
+        hosts
+            .into_iter()
+            .map(|host| self.effective(host, known))
+            .collect()
+    }
+}
+
+/// Known devices with their (opt-in) file.
+#[derive(Default)]
+struct KnownState {
+    devices: KnownDevices,
+    file: Option<PathBuf>,
+    persist: bool,
+}
+
+impl KnownState {
+    /// What to write to disk, if remembering between sessions is on.
+    fn snapshot(&self) -> Option<(PathBuf, Vec<known::KnownDevice>)> {
+        let file = self.file.clone().filter(|_| self.persist)?;
+        Some((file, self.devices.remembered().to_vec()))
     }
 }
 
@@ -68,6 +142,8 @@ pub struct AppState {
     active: Mutex<Option<ActiveScan>>,
     next_scan_id: AtomicU64,
     last_scan: Mutex<Option<ScanRecord>>,
+    /// Lock order: `known` before `last_scan`.
+    known: Mutex<KnownState>,
 }
 
 impl AppState {
@@ -77,7 +153,12 @@ impl AppState {
             active: Mutex::new(None),
             next_scan_id: AtomicU64::new(1),
             last_scan: Mutex::new(None),
+            known: Mutex::new(KnownState::default()),
         }
+    }
+
+    fn known(&self) -> MutexGuard<'_, KnownState> {
+        self.known.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn last_scan(&self) -> MutexGuard<'_, Option<ScanRecord>> {
@@ -91,9 +172,35 @@ impl AppState {
     fn record_hosts(&self, scan_id: u64, hosts: Vec<HostResult>) {
         if let Some(record) = self.last_scan().as_mut().filter(|r| r.scan_id == scan_id) {
             for host in hosts {
-                record.hosts.insert(host.ip, host);
+                record.add(host);
             }
         }
+    }
+
+    /// After a scan: remember every device that answered and return the silent addresses
+    /// whose display changed through known-device data.
+    fn finish_known(
+        &self,
+        scan_id: u64,
+    ) -> (Vec<HostResult>, Option<(PathBuf, Vec<known::KnownDevice>)>) {
+        let mut known = self.known();
+        let mut last = self.last_scan();
+        let Some(record) = last.as_mut().filter(|r| r.scan_id == scan_id) else {
+            return (Vec::new(), None);
+        };
+        for host in record.hosts.values().filter(|h| h.online) {
+            known.devices.remember(host);
+        }
+        let changed = record.refresh_known(&known.devices);
+        (changed, known.snapshot())
+    }
+
+    /// Re-applies known-device data to the last scan after the list changed.
+    fn refresh_last_scan(&self, known: &KnownDevices) -> Vec<HostResult> {
+        self.last_scan()
+            .as_mut()
+            .map(|record| record.refresh_known(known))
+            .unwrap_or_default()
     }
 
     fn active(&self) -> MutexGuard<'_, Option<ActiveScan>> {
@@ -133,6 +240,8 @@ pub struct ScanRequest {
     targets: String,
     concurrency: Option<u32>,
     timeout_ms: Option<u32>,
+    /// Reverse DNS for silent addresses (default: auto).
+    offline_names: Option<OfflineNames>,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,13 +292,17 @@ pub async fn start_scan(
     // The frontend clears its table when a scan is started; keep the export data in step.
     *state.last_scan() = None;
     let targets = TargetSet::parse(&request.targets)?;
-    let config = scan_config(&request)?;
+    let mut config = scan_config(&request)?;
+    config.resolve_offline_names = request
+        .offline_names
+        .unwrap_or_default()
+        .enabled_for(targets.len());
     let total = targets.len() as u32;
     let (scan_id, cancel) = state.begin_scan()?;
     let backend = Arc::clone(&state.backend);
-    *state.last_scan() = Some(ScanRecord {
+    *state.last_scan() = Some(ScanRecord::new(
         scan_id,
-        info: ScanInfo {
+        ScanInfo {
             targets: request.targets.trim().to_owned(),
             started_at_ms: now_ms(),
             finished_at_ms: None,
@@ -201,8 +314,7 @@ pub async fn start_scan(
             concurrency: config.concurrency as u32,
             timeout_ms: config.timeout.as_millis() as u32,
         },
-        hosts: HashMap::new(),
-    });
+    ));
 
     tauri::async_runtime::spawn(async move {
         let emitter = app.clone();
@@ -232,6 +344,25 @@ pub async fn start_scan(
             info.scanned = summary.scanned;
             info.online = summary.online;
             info.errors = summary.errors;
+        }
+        // Known devices: remember who answered, show what is known for silent addresses.
+        let (changed, snapshot) = state.finish_known(scan_id);
+        if !changed.is_empty() {
+            let batch = ScanBatch {
+                scan_id,
+                hosts: changed,
+                scanned: summary.scanned,
+                total: summary.total,
+                online: summary.online,
+            };
+            let _ = app.emit(EVENT_SCAN_BATCH, &batch);
+        }
+        if let Some((file, devices)) = snapshot {
+            let saved =
+                tauri::async_runtime::spawn_blocking(move || known::save(&file, &devices)).await;
+            if !matches!(saved, Ok(Ok(()))) {
+                eprintln!("saving known devices failed");
+            }
         }
         // Free the slot first, so the frontend can start a new scan right after the event.
         state.end_scan(scan_id);
@@ -270,13 +401,137 @@ pub async fn load_settings(app: AppHandle) -> Settings {
 }
 
 #[tauri::command]
-pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
+pub async fn save_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> Result<(), CommandError> {
     settings.validate()?;
     let path = settings_path(&app)?;
+    let remember = settings.remember_devices;
     tauri::async_runtime::spawn_blocking(move || settings.save(&path))
         .await
         .map_err(internal)?
-        .map_err(|e| io_error("settings.io", e))
+        .map_err(|e| io_error("settings.io", e))?;
+
+    // Remembering between sessions is opt-in: on writes the file, off deletes it.
+    let (file, devices) = {
+        let mut known = state.known();
+        known.persist = remember;
+        (known.file.clone(), known.devices.remembered().to_vec())
+    };
+    let Some(file) = file else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || match remember {
+        true => known::save(&file, &devices),
+        false => known::delete(&file),
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|e| io_error("known.io", e))
+}
+
+/// Where remembered devices are stored: next to the portable exe or in the app data dir.
+fn known_devices_path(app: &AppHandle) -> Option<PathBuf> {
+    if let Some(paths) = &app.state::<PortableState>().0 {
+        return Some(paths.known_devices.clone());
+    }
+    let dir = app.path().app_data_dir().ok()?;
+    Some(dir.join("known-devices.json"))
+}
+
+/// Startup: find the known-devices file and load it if remembering is switched on.
+pub fn init_known_devices(app: &AppHandle) {
+    let file = known_devices_path(app);
+    let remember = settings_path(app)
+        .map(|path| Settings::load(&path).remember_devices)
+        .unwrap_or(false);
+    let devices = match (&file, remember) {
+        (Some(file), true) => known::load(file),
+        _ => Vec::new(),
+    };
+    let state = app.state::<AppState>();
+    let mut known = state.known();
+    known.devices.set_remembered(devices);
+    known.file = file;
+    known.persist = remember;
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownUpdate {
+    /// Devices in the loaded file (import) or 0 (forget).
+    devices: usize,
+    /// Rows of the current results whose display changed.
+    hosts: Vec<HostResult>,
+}
+
+fn scan_running() -> CommandError {
+    CommandError::new("export.scan_running", "a scan is still running")
+}
+
+/// "Load previous scan...": reads one of our JSON exports as a baseline of known devices.
+/// Returns `None` if the file dialog was cancelled.
+#[tauri::command]
+pub async fn import_scan(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Option<KnownUpdate>, CommandError> {
+    if state.is_scanning() {
+        return Err(scan_running());
+    }
+    let (tx, rx) = oneshot::channel();
+    app.dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("JSON", &["json"])
+        .pick_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let Some(path) = rx.await.ok().flatten() else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(|e| io_error("import.io", e))?;
+    let devices = tauri::async_runtime::spawn_blocking(move || {
+        let text = known::read_limited(&path, known::MAX_IMPORT_BYTES)
+            .map_err(|e| io_error("import.io", e))?;
+        known::import_export(&text, now_ms())
+            .map_err(|e| CommandError::new(e.code(), e.to_string()))
+    })
+    .await
+    .map_err(internal)??;
+
+    let count = devices.len();
+    let mut known = state.known();
+    known.devices.set_imported(devices);
+    let hosts = state.refresh_last_scan(&known.devices);
+    Ok(Some(KnownUpdate {
+        devices: count,
+        hosts,
+    }))
+}
+
+/// Forgets all known devices (session, saved file and imported baseline).
+#[tauri::command]
+pub async fn forget_known_devices(state: State<'_, AppState>) -> Result<KnownUpdate, CommandError> {
+    if state.is_scanning() {
+        return Err(scan_running());
+    }
+    let (file, hosts) = {
+        let mut known = state.known();
+        known.devices.clear();
+        let hosts = state.refresh_last_scan(&known.devices);
+        (known.file.clone(), hosts)
+    };
+    if let Some(file) = file {
+        tauri::async_runtime::spawn_blocking(move || known::delete(&file))
+            .await
+            .map_err(internal)?
+            .map_err(|e| io_error("known.io", e))?;
+    }
+    Ok(KnownUpdate { devices: 0, hosts })
 }
 
 /// Opens `http(s)://<ip>:<port>/` in the default browser. The URL is built from typed
@@ -417,9 +672,13 @@ pub async fn export_results(
     }
     let no_results = || CommandError::new("export.no_results", "nothing to export");
     let (info, hosts) = {
+        let known = state.known();
         let last = state.last_scan();
         let record = last.as_ref().ok_or_else(no_results)?;
-        (record.info.clone(), record.select(request.ips.as_deref()))
+        (
+            record.info.clone(),
+            record.select(request.ips.as_deref(), &known.devices),
+        )
     };
     if hosts.is_empty() {
         return Err(no_results());
@@ -471,9 +730,9 @@ mod tests {
                 (ip, HostResult::new(ip))
             })
             .collect();
-        ScanRecord {
-            scan_id: 1,
-            info: ScanInfo {
+        let mut record = ScanRecord::new(
+            1,
+            ScanInfo {
                 targets: "10.0.0.0/24".into(),
                 started_at_ms: 0,
                 finished_at_ms: Some(1),
@@ -485,8 +744,9 @@ mod tests {
                 concurrency: 64,
                 timeout_ms: 1000,
             },
-            hosts,
-        }
+        );
+        record.hosts = hosts;
+        record
     }
 
     fn ip(d: u8) -> IpAddr {
@@ -496,14 +756,52 @@ mod tests {
     #[test]
     fn export_selection() {
         let record = record(&[20, 3, 100, 9]);
-        let all: Vec<IpAddr> = record.select(None).iter().map(|h| h.ip).collect();
+        let all: Vec<IpAddr> = record
+            .select(None, &KnownDevices::default())
+            .iter()
+            .map(|h| h.ip)
+            .collect();
         assert_eq!(all, [ip(3), ip(9), ip(20), ip(100)]);
 
         // View order is kept; unknown and repeated addresses are dropped.
         let view = [ip(100), ip(3), ip(77), ip(100), ip(20)];
-        let picked: Vec<IpAddr> = record.select(Some(&view)).iter().map(|h| h.ip).collect();
+        let picked: Vec<IpAddr> = record
+            .select(Some(&view), &KnownDevices::default())
+            .iter()
+            .map(|h| h.ip)
+            .collect();
         assert_eq!(picked, [ip(100), ip(3), ip(20)]);
-        assert!(record.select(Some(&[])).is_empty());
+        assert!(
+            record
+                .select(Some(&[]), &KnownDevices::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn known_data_is_applied_and_removed_again() {
+        let mut record = record(&[5, 6]);
+        let mut known = KnownDevices::default();
+        let mut laptop = HostResult::new(ip(5));
+        laptop.online = true;
+        laptop.names.dns = Some("laptop.lan".into());
+        laptop.pick_hostname();
+        laptop.timestamp_ms = 7;
+        laptop.mark_live();
+        known.remember(&laptop);
+
+        let changed = record.refresh_known(&known);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].hostname.as_deref(), Some("laptop.lan"));
+        assert_eq!(changed[0].status, crate::scan::HostStatus::Offline);
+        // Rows with known data are sent again (cheap: only at scan end, import, forget).
+        assert_eq!(record.refresh_known(&known), changed);
+        // Forgotten: the row goes back to its own data.
+        known.clear();
+        let reverted = record.refresh_known(&known);
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(reverted[0].hostname, None);
+        assert!(record.refresh_known(&known).is_empty());
     }
 
     #[test]
@@ -561,6 +859,7 @@ mod tests {
             targets: String::new(),
             concurrency,
             timeout_ms,
+            offline_names: None,
         }
     }
 

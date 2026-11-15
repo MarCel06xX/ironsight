@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 – 2026-11-15
+
+- Data for devices that do not answer: reverse DNS for all addresses (automatic up to 1,024,
+  configurable), MAC and vendor from the Windows ARP cache, and known devices.
+- Known devices: remembered for the session; optionally saved between sessions (off by default,
+  "Forget all known devices"); "Load previous scan…" imports a JSON export as a baseline.
+- Three states – online, offline, unused – with filters, a "Last seen" column and the source of
+  every value (live, DNS, ARP cache, remembered, imported).
+- Wake-on-LAN for offline devices with a known MAC address.
+- Exports contain status, last seen and data sources; JSON `schema_version` 2 (version 1 can
+  still be imported).
+
 ## 0.1.3 – 2026-11-15
 
 - Test release for the in-app updater. No functional changes.

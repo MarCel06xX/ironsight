@@ -1,5 +1,12 @@
 // Settings dialog. Values are checked here for quick feedback and again in Rust on save.
-import { type AppInfo, type LanguageSetting, type Settings, type ThemeName, saveSettings } from "./api";
+import {
+  type AppInfo,
+  type LanguageSetting,
+  type OfflineNames,
+  type Settings,
+  type ThemeName,
+  saveSettings,
+} from "./api";
 import { type MessageKey, t } from "./i18n";
 import { THEMES, applyTheme } from "./theme";
 
@@ -7,6 +14,12 @@ const LANGUAGES: readonly { id: LanguageSetting; label: MessageKey }[] = [
   { id: "system", label: "language.system" },
   { id: "en", label: "language.en" },
   { id: "de", label: "language.de" },
+];
+
+const OFFLINE_NAMES: readonly { id: OfflineNames; label: MessageKey }[] = [
+  { id: "auto", label: "settings.offlineNamesAuto" },
+  { id: "always", label: "settings.offlineNamesAlways" },
+  { id: "never", label: "settings.offlineNamesNever" },
 ];
 
 const CONCURRENCY = { min: 1, max: 256 };
@@ -50,6 +63,8 @@ export class SettingsDialog {
   private readonly concurrency: HTMLInputElement;
   private readonly timeout: HTMLInputElement;
   private readonly checkUpdates: HTMLInputElement;
+  private readonly offlineNames: HTMLSelectElement;
+  private readonly rememberDevices: HTMLInputElement;
   private readonly checkNowButton: HTMLButtonElement;
   private readonly updateStatus: HTMLElement;
   private readonly error: HTMLElement;
@@ -61,6 +76,8 @@ export class SettingsDialog {
     private readonly info: AppInfo,
     /** Runs a manual update check; resolves to a status text ("" if a dialog opened). */
     private readonly checkNow: () => Promise<string>,
+    /** "Forget all known devices". */
+    forgetDevices: () => Promise<void>,
   ) {
     this.theme = query(dialog, "#set-theme");
     this.language = query(dialog, "#set-language");
@@ -71,6 +88,15 @@ export class SettingsDialog {
     this.checkNowButton = query(dialog, "#set-check-now");
     this.updateStatus = query(dialog, "#set-update-status");
     this.checkNowButton.addEventListener("click", () => void this.runCheck());
+    this.offlineNames = query(dialog, "#set-offline-names");
+    this.rememberDevices = query(dialog, "#set-remember");
+    const forget = query<HTMLButtonElement>(dialog, "#set-forget");
+    forget.addEventListener("click", () => {
+      forget.disabled = true;
+      void forgetDevices().finally(() => {
+        forget.disabled = false;
+      });
+    });
 
     // Live preview; reverted on cancel.
     this.theme.addEventListener("change", () => applyTheme(this.theme.value as ThemeName));
@@ -94,6 +120,8 @@ export class SettingsDialog {
     this.concurrency.value = String(current.concurrency);
     this.timeout.value = String(current.timeoutMs);
     this.checkUpdates.checked = current.checkUpdates;
+    fillSelect(this.offlineNames, OFFLINE_NAMES, current.offlineNames);
+    this.rememberDevices.checked = current.rememberDevices;
     query(this.dialog, "#set-version").textContent = t(
       this.info.portable ? "settings.versionPortable" : "settings.version",
       { version: this.info.version },
@@ -143,6 +171,8 @@ export class SettingsDialog {
       concurrency,
       timeoutMs,
       checkUpdates: this.checkUpdates.checked,
+      offlineNames: this.offlineNames.value as OfflineNames,
+      rememberDevices: this.rememberDevices.checked,
     };
     try {
       await saveSettings(next);

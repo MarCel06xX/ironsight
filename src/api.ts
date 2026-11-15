@@ -21,6 +21,20 @@ export interface Adapter {
 
 export type NameSource = "dns" | "mdns" | "netbios";
 
+/** online: answered now; offline: silent but data exists; unused: silent, nothing known. */
+export type HostStatus = "online" | "offline" | "unused";
+
+/** Where a shown value came from. */
+export type DataSource = "live" | "dns" | "arpCache" | "remembered" | "imported";
+
+export interface FieldSources {
+  hostname: DataSource | null;
+  mac: DataSource | null;
+  vendor: DataSource | null;
+  services: DataSource | null;
+  workgroup: DataSource | null;
+}
+
 export interface HttpInfo {
   status: number | null;
   server: string | null;
@@ -57,6 +71,10 @@ export interface HostResult {
   workgroup: string | null;
   services: ServiceInfo[];
   timestampMs: number;
+  status: HostStatus;
+  /** When the device was last seen online (now, or from the known devices). */
+  lastSeenMs: number | null;
+  sources: FieldSources;
 }
 
 export interface ScanBatch {
@@ -78,10 +96,14 @@ export interface ScanSummary {
   finishedAtMs: number;
 }
 
+export type OfflineNames = "auto" | "always" | "never";
+
 export interface ScanRequest {
   targets: string;
   concurrency?: number;
   timeoutMs?: number;
+  /** Reverse DNS for addresses that do not answer. */
+  offlineNames?: OfflineNames;
 }
 
 export interface ScanStarted {
@@ -106,6 +128,16 @@ export interface Settings {
   checkUpdates: boolean;
   /** Version the user chose to skip in the update dialog. */
   skippedVersion: string | null;
+  offlineNames: OfflineNames;
+  /** Save known devices to disk (opt-in). */
+  rememberDevices: boolean;
+}
+
+/** Result of loading a previous scan or forgetting known devices. */
+export interface KnownUpdate {
+  devices: number;
+  /** Rows of the current results whose display changed. */
+  hosts: HostResult[];
 }
 
 export interface AppInfo {
@@ -165,6 +197,11 @@ export const exportResults = (request: ExportRequest): Promise<string | null> =>
   invoke("export_results", { request });
 
 export const getAppInfo = (): Promise<AppInfo> => invoke("app_info");
+
+/** "Load previous scan…": `null` if the file dialog was cancelled. */
+export const importScan = (): Promise<KnownUpdate | null> => invoke("import_scan");
+
+export const forgetKnownDevices = (): Promise<KnownUpdate> => invoke("forget_known_devices");
 
 /** Opens the GitHub page of the newest release in the browser. */
 export const openReleasePage = (): Promise<void> => invoke("open_release_page");

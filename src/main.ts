@@ -3,10 +3,14 @@
 import {
   type AppInfo,
   type HostResult,
+  type HostStatus,
+  type KnownUpdate,
   type ScanBatch,
   type ScanSummary,
   type Settings,
+  forgetKnownDevices,
   getAppInfo,
+  importScan,
   isCommandError,
   listAdapters,
   loadSettings,
@@ -26,6 +30,7 @@ import {
   hostnameText,
   rttText,
   servicesText,
+  statusClass,
   statusKey,
   vendorText,
   webPort,
@@ -37,6 +42,7 @@ import {
   applyTranslations,
   detectLanguage,
   formatNumber,
+  formatRelative,
   isMessageKey,
   onLanguageChange,
   setLanguage,
@@ -58,7 +64,11 @@ const DEFAULT_SETTINGS: Settings = {
   csvDelimiter: ";",
   checkUpdates: true,
   skippedVersion: null,
+  offlineNames: "auto",
+  rememberDevices: false,
 };
+/** Relative "last seen" times are refreshed this often. */
+const RELATIVE_TIME_REFRESH_MS = 60_000;
 /** Delay before the background update check, so the window is shown first. */
 const UPDATE_CHECK_DELAY_MS = 1500;
 /** Minimum time between table refreshes while results stream in. */
@@ -80,7 +90,12 @@ const settingsButton = byId<HTMLButtonElement>("settings-btn");
 const exportButton = byId<HTMLButtonElement>("export-btn");
 const errorBox = byId<HTMLParagraphElement>("error");
 const filterInput = byId<HTMLInputElement>("filter");
-const onlineOnlyBox = byId<HTMLInputElement>("only-online");
+const importButton = byId<HTMLButtonElement>("import-btn");
+const statusToggles: Record<HostStatus, HTMLInputElement> = {
+  online: byId("show-online"),
+  offline: byId("show-offline"),
+  unused: byId("show-unused"),
+};
 const shownCount = byId<HTMLSpanElement>("shown-count");
 const detailsPanel = byId<HTMLElement>("details");
 
@@ -124,7 +139,7 @@ const columns: Column[] = [
     label: "col.status",
     render: (cell, host) => {
       const dot = document.createElement("span");
-      dot.className = `dot ${!host.online ? "offline" : host.complete ? "online" : "pending"}`;
+      dot.className = `dot ${statusClass(host)}`;
       cell.append(dot, document.createTextNode(t(statusKey(host))));
     },
   },
@@ -136,6 +151,9 @@ const columns: Column[] = [
   textColumn("services", "col.services", servicesText),
   textColumn("web", "col.web", (host) => webText(host) ?? ""),
   textColumn("workgroup", "col.workgroup", (host) => host.workgroup ?? ""),
+  textColumn("lastSeen", "col.lastSeen", (host) =>
+    host.lastSeenMs === null ? "" : formatRelative(host.lastSeenMs),
+  ),
 ];
 
 const table = new VirtualTable(byId("table"), columns, {
@@ -164,6 +182,7 @@ function refreshView(): void {
     total: formatNumber(store.total),
   });
   exportButton.disabled = running || store.total === 0;
+  importButton.disabled = running;
   updateDetails(false);
 }
 
@@ -300,6 +319,7 @@ function setRunning(value: boolean): void {
   targetInput.disabled = value;
   adapterSelect.disabled = value;
   exportButton.disabled = value || store.total === 0;
+  importButton.disabled = value;
   renderScanButton();
 }
 
@@ -314,7 +334,9 @@ function renderProgress(): void {
   const counts = t("scan.progress", {
     scanned: formatNumber(scanned),
     total: formatNumber(total),
-    online: formatNumber(online),
+    online: formatNumber(Math.max(online, store.count("online"))),
+    offline: formatNumber(store.count("offline")),
+    unused: formatNumber(store.count("unused")),
   });
   const prefix: Record<ScanStatus, MessageKey | null> = {
     ready: null,
@@ -346,6 +368,7 @@ async function toggleScan(): Promise<void> {
       targets: targetInput.value,
       concurrency: settings.concurrency,
       timeoutMs: settings.timeoutMs,
+      offlineNames: settings.offlineNames,
     });
     // Batches may already have arrived; only fill in the total if none did.
     if (progress.total === 0) {
@@ -444,6 +467,33 @@ function skipVersion(version: string): void {
   saveSettings(settings).catch((error: unknown) => console.warn("saving settings failed", error));
 }
 
+/** Applies rows changed by loading a previous scan or forgetting known devices. */
+function applyKnownUpdate(update: KnownUpdate): void {
+  store.upsert(update.hosts);
+  renderProgress();
+  refreshView();
+}
+
+async function loadPreviousScan(): Promise<void> {
+  try {
+    const update = await importScan();
+    if (!update) return;
+    applyKnownUpdate(update);
+    toast.show(t("import.done", { count: formatNumber(update.devices) }));
+  } catch (error) {
+    toast.show(errorText(error), "error");
+  }
+}
+
+async function forgetDevices(): Promise<void> {
+  try {
+    applyKnownUpdate(await forgetKnownDevices());
+    toast.show(t("known.forgotten"));
+  } catch (error) {
+    toast.show(errorText(error), "error");
+  }
+}
+
 /** Manual check from the settings dialog; errors are shown there. */
 async function checkForUpdateNow(): Promise<string> {
   const update = await findUpdate();
@@ -505,10 +555,19 @@ function wireEvents(): void {
       refreshView();
     }, FILTER_DELAY_MS);
   });
-  onlineOnlyBox.addEventListener("change", () => {
-    store.setOnlineOnly(onlineOnlyBox.checked);
-    refreshView();
-  });
+  for (const [status, toggle] of Object.entries(statusToggles) as [HostStatus, HTMLInputElement][]) {
+    toggle.checked = store.isVisible(status);
+    toggle.addEventListener("change", () => {
+      store.setVisible(status, toggle.checked);
+      refreshView();
+    });
+  }
+  importButton.addEventListener("click", () => void loadPreviousScan());
+  // Keep relative "last seen" times current.
+  window.setInterval(() => {
+    table.invalidate();
+    updateDetails(true);
+  }, RELATIVE_TIME_REFRESH_MS);
   // No browser context menu outside text fields; Ctrl+F jumps to the filter.
   document.addEventListener("contextmenu", (event) => {
     if (!(event.target instanceof Element && event.target.closest("input, textarea"))) {
@@ -542,6 +601,7 @@ async function init(): Promise<void> {
     errorText,
     appInfo,
     checkForUpdateNow,
+    forgetDevices,
   );
   updateDialog = new UpdateDialog(byId("update-dialog"), appInfo, {
     isScanning: () => running,

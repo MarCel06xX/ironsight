@@ -20,6 +20,8 @@
     "allow-export-results",
     "allow-app-info",
     "allow-open-release-page",
+    "allow-import-scan",
+    "allow-forget-known-devices",
     "updater:default",
     "process:allow-restart"
   ]

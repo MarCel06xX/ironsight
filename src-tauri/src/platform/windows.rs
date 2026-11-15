@@ -9,15 +9,21 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
-    GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, ICMP_ECHO_REPLY, IF_TYPE_SOFTWARE_LOOPBACK,
-    IP_ADAPTER_ADDRESSES_LH, IP_SUCCESS, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, SendARP,
+    FreeMibTable, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
+    GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, GetIpNetTable2, ICMP_ECHO_REPLY,
+    IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH, IP_SUCCESS, IcmpCloseHandle,
+    IcmpCreateFile, IcmpSendEcho, MIB_IPNET_TABLE2, SendARP,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKET_ADDRESS};
+use windows::Win32::Networking::WinSock::{
+    ADDRESS_FAMILY, NL_NEIGHBOR_STATE, NlnsDelay, NlnsIncomplete, NlnsPermanent, NlnsProbe,
+    NlnsReachable, NlnsStale, NlnsUnreachable, SOCKADDR_IN, SOCKET_ADDRESS,
+};
 use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW};
 
-use super::{Adapter, Ipv4Net, LaunchError, NetBackend, NetError};
+use super::{
+    Adapter, Ipv4Net, LaunchError, Neighbor, NeighborState, NetBackend, NetError, usable_neighbor,
+};
 use crate::mac::MacAddr;
 
 const AF_INET: u16 = 2;
@@ -152,6 +158,10 @@ impl NetBackend for WindowsBackend {
             Ok(None)
         }
     }
+
+    fn neighbor_cache(&self) -> Result<Vec<Neighbor>, NetError> {
+        Self::read_neighbor_cache()
+    }
 }
 
 /// `mstsc.exe /v:<ip>` from the system directory.
@@ -194,6 +204,59 @@ fn os_dir(get: unsafe fn(Option<&mut [u16]>) -> u32) -> Result<PathBuf, LaunchEr
         return Err(LaunchError::NoSystemDir);
     }
     Ok(PathBuf::from(OsString::from_wide(&buf[..len])))
+}
+
+impl WindowsBackend {
+    /// IPv4 neighbor cache via `GetIpNetTable2`.
+    fn read_neighbor_cache() -> Result<Vec<Neighbor>, NetError> {
+        let mut table: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
+        // SAFETY: on success the API allocates the table, which is freed below.
+        let rc = unsafe { GetIpNetTable2(ADDRESS_FAMILY(AF_INET), &mut table) };
+        if rc.0 != NO_ERROR || table.is_null() {
+            return Err(NetError::Os {
+                api: "GetIpNetTable2",
+                code: rc.0,
+            });
+        }
+        let mut neighbors = Vec::new();
+        // SAFETY: `table` points to a valid table with `NumEntries` rows until it is freed.
+        unsafe {
+            let count = (*table).NumEntries as usize;
+            let rows = std::ptr::addr_of!((*table).Table)
+                .cast::<windows::Win32::NetworkManagement::IpHelper::MIB_IPNET_ROW2>();
+            for i in 0..count {
+                let row = &*rows.add(i);
+                if row.Address.si_family.0 != AF_INET {
+                    continue;
+                }
+                let ip = Ipv4Addr::from(row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes());
+                let len = (row.PhysicalAddressLength as usize).min(row.PhysicalAddress.len());
+                if let Some(neighbor) =
+                    usable_neighbor(ip, &row.PhysicalAddress[..len], neighbor_state(row.State))
+                {
+                    neighbors.push(neighbor);
+                }
+            }
+            FreeMibTable(table.cast());
+        }
+        Ok(neighbors)
+    }
+}
+
+fn neighbor_state(state: NL_NEIGHBOR_STATE) -> NeighborState {
+    let states = [
+        (NlnsUnreachable, NeighborState::Unreachable),
+        (NlnsIncomplete, NeighborState::Incomplete),
+        (NlnsProbe, NeighborState::Probe),
+        (NlnsDelay, NeighborState::Delay),
+        (NlnsStale, NeighborState::Stale),
+        (NlnsReachable, NeighborState::Reachable),
+        (NlnsPermanent, NeighborState::Permanent),
+    ];
+    states
+        .into_iter()
+        .find(|(raw, _)| *raw == state)
+        .map_or(NeighborState::Unknown, |(_, mapped)| mapped)
 }
 
 /// Closes the ICMP handle on drop.
@@ -412,6 +475,13 @@ mod tests {
     }
 
     #[test]
+    fn reads_neighbor_cache_without_error() {
+        for neighbor in WindowsBackend.neighbor_cache().unwrap() {
+            assert!(!neighbor.mac.is_zero());
+        }
+    }
+
+    #[test]
     fn pings_loopback() {
         let rtt = WindowsBackend
             .icmp_ping(IpAddr::V4(Ipv4Addr::LOCALHOST), Duration::from_millis(1000))
@@ -458,6 +528,7 @@ mod live {
             ScanConfig {
                 concurrency: 64,
                 timeout: Duration::from_millis(1000),
+                resolve_offline_names: true,
             },
             cancelled,
             1,

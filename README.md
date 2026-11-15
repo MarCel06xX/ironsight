@@ -31,8 +31,15 @@ _Screenshots will follow._
   address and vendor (embedded IEEE OUI table, randomized/private MACs are labeled), response
   time, NetBIOS workgroup, open services from a small port list (FTP, SSH, Telnet, HTTP, HTTPS,
   SMB, RDP, 8080, 8443), and HTTP `Server` header and page title.
+- **Offline devices:** addresses that do not answer still show what is known – reverse DNS names
+  (the router often knows them from DHCP), MAC and vendor from the Windows ARP cache, and devices
+  seen earlier: in this session, saved between sessions (opt-in) or loaded from a previous JSON
+  export ("Load previous scan…"). Every value shows where it came from (live, DNS, ARP cache,
+  remembered, imported), and each address is *online*, *offline* (silent, but data exists) or
+  *unused*.
 - **Live results** in a fast virtual table that stays smooth with 65,536 rows: sortable columns
-  (IP addresses sort numerically), text filter, "show only online", details panel.
+  (IP addresses sort numerically), text filter, filters for online / offline / unused, "Last
+  seen" column, details panel.
 - **Actions per host:** copy IP or MAC, open in the browser (HTTP/HTTPS), connect with Remote
   Desktop, show file shares in Explorer, Wake-on-LAN.
 - **Export:** CSV (Excel-friendly, `;` or `,` as delimiter), JSON (all data, versioned schema)
@@ -45,8 +52,9 @@ _Screenshots will follow._
   opens the download page instead.
 - **Privacy:** no telemetry. Besides the scan itself, Ironsight only contacts github.com once per
   start to check for a new version (it downloads `latest.json`; you can turn this off in the
-  settings). Nothing else is sent. Scan results are only written to disk when you export them;
-  only the settings are saved.
+  settings). Nothing else is sent. Nothing is written to disk except the settings, unless you ask
+  for it: scan results only when you export them, known devices only if you switch on "Remember
+  devices between sessions" (off by default; "Forget all known devices" deletes the file).
 
 ## Download
 
@@ -81,6 +89,7 @@ matter). Then choose **More info → Run anyway**.
 | Names | Reverse DNS (PTR), mDNS, NetBIOS node status | Hand-written packet builders and parsers; all received data is bounds-checked and treated as untrusted. |
 | Vendor | IEEE MA-L registry | Converted into a compact table and embedded in the program – no downloads at runtime. |
 | Services | TCP connect, HTTP/1.0 `GET /` | Page titles are read on ports 80 and 8080. Redirects are only followed on the same host and port. |
+| Silent addresses | Reverse DNS for every address (automatic up to 1,024 addresses, configurable), `GetIpNetTable2` neighbor cache, known devices | Matched by MAC, or by IP when no MAC is known. If an address answers with a different MAC, the live device wins. |
 
 ## Build from source
 
@@ -163,8 +172,13 @@ Informationen zu ihnen an und exportiert die Ergebnisse.
   Listen mit Kommas; bis zu 65.536 Adressen pro Scan.
 - **Geräteinfos:** Hostname aus DNS, mDNS und NetBIOS (mit Quelle), MAC-Adresse und Hersteller,
   Antwortzeit, Arbeitsgruppe, offene Dienste sowie Webserver und Seitentitel.
-- **Live-Ergebnisse** in einer schnellen Tabelle mit Sortierung, Filter, „Nur online anzeigen“ und
-  Detailansicht.
+- **Offline-Geräte:** Auch Adressen ohne Antwort zeigen, was bekannt ist: Namen per Reverse-DNS,
+  MAC und Hersteller aus dem ARP-Cache sowie früher gesehene Geräte (aus dieser Sitzung, optional
+  gespeichert oder aus einem früheren JSON-Export über „Vorherigen Scan laden …“). Zu jedem Wert
+  steht die Quelle; jede Adresse ist *online*, *offline* (stumm, aber Daten vorhanden) oder
+  *unbelegt*.
+- **Live-Ergebnisse** in einer schnellen Tabelle mit Sortierung, Filter, Schaltern für
+  online / offline / unbelegt, Spalte „Zuletzt gesehen“ und Detailansicht.
 - **Aktionen:** IP/MAC kopieren, im Browser öffnen, Remotedesktop, Freigaben im Explorer,
   Wake-on-LAN.
 - **Export** als CSV (für deutsches Excel mit `;`), JSON oder druckbarer HTML-Bericht.
@@ -173,7 +187,9 @@ Informationen zu ihnen an und exportiert die Ergebnisse.
   sie nach Bestätigung (signierte Update-Pakete). Die portable Version öffnet die Download-Seite.
 - **Datenschutz:** keine Telemetrie. Außer dem Scan kontaktiert Ironsight nur einmal pro Start
   github.com, um nach Updates zu suchen (lädt `latest.json`; in den Einstellungen abschaltbar).
-  Sonst wird nichts gesendet. Ergebnisse werden nur beim Export gespeichert.
+  Sonst wird nichts gesendet. Außer den Einstellungen landet nichts auf der Festplatte, solange du
+  es nicht willst: Ergebnisse nur beim Export, bekannte Geräte nur mit „Geräte zwischen Sitzungen
+  merken“ (standardmäßig aus; „Alle bekannten Geräte vergessen“ löscht die Datei).
 
 ### Download
 

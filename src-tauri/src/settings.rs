@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CommandError;
 use crate::export::Delimiter;
-use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, ScanConfig};
+use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, OfflineNames, ScanConfig};
 
 pub const FILE_NAME: &str = "settings.json";
 const MAX_FILE_SIZE: u64 = 64 * 1024;
@@ -49,6 +49,10 @@ pub struct Settings {
     pub check_updates: bool,
     /// Version the user chose to skip in the update dialog.
     pub skipped_version: Option<String>,
+    /// Reverse DNS for addresses that do not answer.
+    pub offline_names: OfflineNames,
+    /// Save known devices to disk (opt-in; off: memory only).
+    pub remember_devices: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +65,8 @@ impl Default for Settings {
             csv_delimiter: Delimiter::Semicolon,
             check_updates: true,
             skipped_version: None,
+            offline_names: OfflineNames::Auto,
+            remember_devices: false,
         }
     }
 }
@@ -165,6 +171,8 @@ mod tests {
             csv_delimiter: Delimiter::Comma,
             check_updates: false,
             skipped_version: Some("0.2.0".into()),
+            offline_names: OfflineNames::Never,
+            remember_devices: true,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -192,7 +200,9 @@ mod tests {
                 "timeoutMs": 1000,
                 "csvDelimiter": ";",
                 "checkUpdates": true,
-                "skippedVersion": null
+                "skippedVersion": null,
+                "offlineNames": "auto",
+                "rememberDevices": false
             })
         );
     }

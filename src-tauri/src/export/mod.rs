@@ -5,7 +5,7 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::scan::{HostResult, NameSource};
+use crate::scan::{DataSource, HostResult, HostStatus, NameSource};
 
 mod csv;
 mod html;
@@ -127,11 +127,39 @@ pub fn default_file_name(options: &ExportOptions, started_at_ms: u64) -> String 
 // --- helpers shared by the writers -------------------------------------------------------
 
 fn status_key(host: &HostResult) -> &'static str {
-    if host.online {
-        "status.online"
-    } else {
-        "status.offline"
+    match host.status {
+        HostStatus::Online => "status.online",
+        HostStatus::Offline => "status.offline",
+        HostStatus::Unused => "status.unused",
     }
+}
+
+fn origin_key(source: DataSource) -> &'static str {
+    match source {
+        DataSource::Live => "origin.live",
+        DataSource::Dns => "origin.dns",
+        DataSource::ArpCache => "origin.arpCache",
+        DataSource::Remembered => "origin.remembered",
+        DataSource::Imported => "origin.imported",
+    }
+}
+
+/// Where the shown data came from, e.g. `DNS, ARP cache`; empty if there is none.
+fn sources_text(host: &HostResult, labels: &Labels) -> String {
+    let s = host.sources;
+    let mut seen: Vec<DataSource> = Vec::new();
+    for source in [s.hostname, s.mac, s.vendor, s.services, s.workgroup]
+        .into_iter()
+        .flatten()
+    {
+        if !seen.contains(&source) {
+            seen.push(source);
+        }
+    }
+    seen.into_iter()
+        .map(|source| labels.get(origin_key(source)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn source_key(source: NameSource) -> &'static str {
@@ -236,10 +264,12 @@ pub(crate) mod tests {
         });
         router.services = vec![http, ServiceInfo::open(443)];
         router.timestamp_ms = STARTED;
+        router.mark_live();
 
         let mut offline = HostResult::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)));
         offline.complete = true;
         offline.timestamp_ms = STARTED;
+        offline.update_status();
         vec![router, offline]
     }
 
@@ -257,6 +287,7 @@ pub(crate) mod tests {
     fn no_untranslated_keys_in_any_format() {
         let prefixes = [
             "export.", "col.", "status.", "source.", "details.", "seenBy.", "rtt.", "vendor.",
+            "origin.",
         ];
         for language in [ReportLanguage::En, ReportLanguage::De] {
             for kind in [ExportKind::Csv, ExportKind::Json, ExportKind::Html] {
@@ -267,6 +298,9 @@ pub(crate) mod tests {
                 let mut hosts = sample_hosts();
                 hosts[1].mac = Some(MacAddr([0x02, 0, 0, 0, 0, 1]));
                 hosts[1].mac_local = true;
+                hosts[1].sources.mac = Some(DataSource::ArpCache);
+                hosts[1].last_seen_ms = Some(STARTED);
+                hosts[1].update_status();
                 hosts[1].rtt_ms = Some(0);
                 let mut out = Vec::new();
                 write_export(&mut out, &info, &hosts, &options).unwrap();

@@ -1,5 +1,5 @@
 // Display helpers shared by the table, the details panel, sorting and filtering.
-import type { HostResult, NameSource } from "./api";
+import type { DataSource, HostResult, HostStatus, NameSource } from "./api";
 import { type MessageKey, formatNumber, t } from "./i18n";
 
 const SOURCE_KEYS: Record<NameSource, MessageKey> = {
@@ -12,8 +12,32 @@ export function sourceLabel(source: NameSource): string {
   return t(SOURCE_KEYS[source]);
 }
 
+const STATUS_KEYS: Record<HostStatus, MessageKey> = {
+  online: "status.online",
+  offline: "status.offline",
+  unused: "status.unused",
+};
+
+const ORIGIN_KEYS: Record<DataSource, MessageKey> = {
+  live: "origin.live",
+  dns: "origin.dns",
+  arpCache: "origin.arpCache",
+  remembered: "origin.remembered",
+  imported: "origin.imported",
+};
+
 export function statusKey(host: HostResult): MessageKey {
-  return host.online ? "status.online" : "status.offline";
+  return STATUS_KEYS[host.status];
+}
+
+/** CSS class of the status dot: online (enriched), pending (lookups running), offline, unused. */
+export function statusClass(host: HostResult): string {
+  if (host.status !== "online") return host.status;
+  return host.complete ? "online" : "pending";
+}
+
+export function originLabel(source: DataSource): string {
+  return t(ORIGIN_KEYS[source]);
 }
 
 export function hostnameText(host: HostResult): string {

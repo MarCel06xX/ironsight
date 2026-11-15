@@ -1,5 +1,5 @@
 // In-memory scan results with filtered + sorted view. Nothing here is ever persisted.
-import type { HostResult } from "./api";
+import type { HostResult, HostStatus } from "./api";
 import { ipSortKey, webText } from "./format";
 import { currentLanguage } from "./i18n";
 
@@ -12,7 +12,8 @@ export type SortKey =
   | "rtt"
   | "services"
   | "web"
-  | "workgroup";
+  | "workgroup"
+  | "lastSeen";
 
 interface Entry {
   host: HostResult;
@@ -46,8 +47,8 @@ function searchText(host: HostResult): string {
 }
 
 function statusRank(host: HostResult): number {
-  if (!host.online) return 2;
-  return host.complete ? 0 : 1;
+  if (host.status === "online") return host.complete ? 0 : 1;
+  return host.status === "offline" ? 2 : 3;
 }
 
 function makeCollator(): Intl.Collator {
@@ -59,7 +60,9 @@ export class HostStore {
   private view: HostResult[] | null = null;
   private collator = makeCollator();
   private filter = "";
-  private onlineOnly = true;
+  /** Statuses shown in the table; unused addresses are hidden by default. */
+  private readonly visible = new Set<HostStatus>(["online", "offline"]);
+  private readonly counts: Record<HostStatus, number> = { online: 0, offline: 0, unused: 0 };
   sortKey: SortKey = "ip";
   ascending = true;
 
@@ -71,8 +74,16 @@ export class HostStore {
     return this.entries.get(ip)?.host;
   }
 
+  /** Scanned addresses per status. */
+  count(status: HostStatus): number {
+    return this.counts[status];
+  }
+
   upsert(hosts: readonly HostResult[]): void {
     for (const host of hosts) {
+      const previous = this.entries.get(host.ip);
+      if (previous) this.counts[previous.host.status] -= 1;
+      this.counts[host.status] += 1;
       this.entries.set(host.ip, { host, ipKey: ipSortKey(host.ip), search: searchText(host) });
     }
     if (hosts.length > 0) this.view = null;
@@ -80,6 +91,9 @@ export class HostStore {
 
   clear(): void {
     this.entries.clear();
+    this.counts.online = 0;
+    this.counts.offline = 0;
+    this.counts.unused = 0;
     this.view = null;
   }
 
@@ -108,11 +122,15 @@ export class HostStore {
     }
   }
 
-  setOnlineOnly(onlineOnly: boolean): void {
-    if (onlineOnly !== this.onlineOnly) {
-      this.onlineOnly = onlineOnly;
-      this.view = null;
-    }
+  isVisible(status: HostStatus): boolean {
+    return this.visible.has(status);
+  }
+
+  setVisible(status: HostStatus, shown: boolean): void {
+    if (shown === this.visible.has(status)) return;
+    if (shown) this.visible.add(status);
+    else this.visible.delete(status);
+    this.view = null;
   }
 
   /** Text sorting follows the UI language. */
@@ -130,7 +148,7 @@ export class HostStore {
   private compute(): HostResult[] {
     const matches: Entry[] = [];
     for (const entry of this.entries.values()) {
-      if (this.onlineOnly && !entry.host.online) continue;
+      if (!this.visible.has(entry.host.status)) continue;
       if (this.filter !== "" && !entry.search.includes(this.filter)) continue;
       matches.push(entry);
     }
@@ -179,6 +197,8 @@ export class HostStore {
         return byText(webText);
       case "workgroup":
         return byText((host) => host.workgroup);
+      case "lastSeen":
+        return byNumber((host) => host.lastSeenMs);
     }
   }
 }

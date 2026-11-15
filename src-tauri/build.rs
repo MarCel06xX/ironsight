@@ -14,6 +14,8 @@ fn main() {
         "export_results",
         "app_info",
         "open_release_page",
+        "import_scan",
+        "forget_known_devices",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("failed to run tauri-build");

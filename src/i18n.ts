@@ -12,6 +12,7 @@ const listeners: Array<() => void> = [];
 let current: Language = detectLanguage(navigator.language);
 let numberFormat = new Intl.NumberFormat(current);
 let dateTimeFormat = makeDateTimeFormat(current);
+let relativeFormat = new Intl.RelativeTimeFormat(current, { numeric: "auto" });
 
 function makeDateTimeFormat(language: Language): Intl.DateTimeFormat {
   return new Intl.DateTimeFormat(language, { dateStyle: "medium", timeStyle: "medium" });
@@ -45,6 +46,26 @@ export function formatDateTime(ms: number): string {
   return dateTimeFormat.format(new Date(ms));
 }
 
+const RELATIVE_STEPS: readonly [Intl.RelativeTimeFormatUnit, number][] = [
+  ["minute", 60],
+  ["hour", 60 * 60],
+  ["day", 24 * 60 * 60],
+  ["month", 30 * 24 * 60 * 60],
+  ["year", 365 * 24 * 60 * 60],
+];
+
+/** "just now", "5 minutes ago", "3 days ago" … */
+export function formatRelative(ms: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.round((now - ms) / 1000));
+  if (seconds < 60) return t("time.justNow");
+  let unit: Intl.RelativeTimeFormatUnit = "minute";
+  let size = 60;
+  for (const [candidate, candidateSize] of RELATIVE_STEPS) {
+    if (seconds >= candidateSize) [unit, size] = [candidate, candidateSize];
+  }
+  return relativeFormat.format(-Math.floor(seconds / size), unit);
+}
+
 function translateAttribute(key: string | undefined): string {
   if (key !== undefined && isMessageKey(key)) return t(key);
   console.warn(`unknown i18n key: ${key}`);
@@ -74,6 +95,7 @@ export function setLanguage(language: Language): void {
   current = language;
   numberFormat = new Intl.NumberFormat(language);
   dateTimeFormat = makeDateTimeFormat(language);
+  relativeFormat = new Intl.RelativeTimeFormat(language, { numeric: "auto" });
   applyTranslations(document);
   for (const listener of listeners) listener();
 }

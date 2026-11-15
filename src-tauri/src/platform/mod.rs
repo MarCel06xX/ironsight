@@ -96,6 +96,54 @@ pub trait NetBackend: Send + Sync + 'static {
 
     /// Sends one ICMP echo request. `Ok(None)` means no reply within `timeout`.
     fn icmp_ping(&self, target: IpAddr, timeout: Duration) -> Result<Option<Duration>, NetError>;
+
+    /// IPv4 entries of the OS neighbor (ARP) cache with a usable MAC address, see
+    /// [`usable_neighbor`]. The default (no cache available) is an empty list.
+    fn neighbor_cache(&self) -> Result<Vec<Neighbor>, NetError> {
+        Ok(Vec::new())
+    }
+}
+
+/// An entry of the OS neighbor cache: this address had this MAC address recently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Neighbor {
+    pub ip: Ipv4Addr,
+    pub mac: MacAddr,
+}
+
+/// State of a neighbor cache entry (`NL_NEIGHBOR_STATE` on Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighborState {
+    Unreachable,
+    Incomplete,
+    Probe,
+    Delay,
+    Stale,
+    Reachable,
+    Permanent,
+    Unknown,
+}
+
+/// Turns a raw cache entry into a [`Neighbor`] if it names a real unicast device: the
+/// address resolution must have succeeded at some point (not unreachable/incomplete), the
+/// hardware address must be a 6-byte unicast MAC (not zero, broadcast or multicast) and the
+/// IP must be a unicast address (multicast/broadcast entries are static OS entries).
+pub fn usable_neighbor(ip: Ipv4Addr, hw: &[u8], state: NeighborState) -> Option<Neighbor> {
+    if matches!(
+        state,
+        NeighborState::Unreachable | NeighborState::Incomplete | NeighborState::Unknown
+    ) {
+        return None;
+    }
+    let bytes: [u8; 6] = hw.try_into().ok()?;
+    let mac = MacAddr(bytes);
+    let unicast_mac = !mac.is_zero() && bytes[0] & 0x01 == 0;
+    let unicast_ip = !(ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.octets()[0] >= 224);
+    (unicast_mac && unicast_ip).then_some(Neighbor { ip, mac })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -177,6 +225,54 @@ mod tests {
         );
         assert_eq!(broadcast([10, 0, 0, 4], 31), None);
         assert_eq!(broadcast([10, 0, 0, 4], 32), None);
+    }
+
+    #[test]
+    fn neighbor_cache_filtering() {
+        let ip = Ipv4Addr::new(192, 168, 1, 23);
+        let mac = [0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
+        let expected = Some(Neighbor {
+            ip,
+            mac: MacAddr(mac),
+        });
+        for state in [
+            NeighborState::Stale,
+            NeighborState::Reachable,
+            NeighborState::Delay,
+            NeighborState::Probe,
+            NeighborState::Permanent,
+        ] {
+            assert_eq!(usable_neighbor(ip, &mac, state), expected, "{state:?}");
+        }
+        // Resolution never succeeded.
+        for state in [
+            NeighborState::Unreachable,
+            NeighborState::Incomplete,
+            NeighborState::Unknown,
+        ] {
+            assert_eq!(usable_neighbor(ip, &mac, state), None, "{state:?}");
+        }
+        // Unusable hardware addresses.
+        let stale = NeighborState::Stale;
+        assert_eq!(usable_neighbor(ip, &[0; 6], stale), None);
+        assert_eq!(usable_neighbor(ip, &[0xff; 6], stale), None);
+        assert_eq!(
+            usable_neighbor(ip, &[0x01, 0x00, 0x5e, 0, 0, 1], stale),
+            None
+        );
+        assert_eq!(usable_neighbor(ip, &mac[..4], stale), None);
+        assert_eq!(usable_neighbor(ip, &[0; 8], stale), None);
+        // Static entries for multicast and broadcast addresses.
+        let permanent = NeighborState::Permanent;
+        for addr in [
+            Ipv4Addr::new(224, 0, 0, 22),
+            Ipv4Addr::new(239, 255, 255, 250),
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+        ] {
+            assert_eq!(usable_neighbor(addr, &mac, permanent), None, "{addr}");
+        }
     }
 
     #[test]

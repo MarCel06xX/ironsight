@@ -173,7 +173,8 @@ export class VirtualTable {
       row.host = host;
       row.generation = this.generation;
       row.el.dataset.ip = host.ip;
-      row.el.classList.toggle("offline", !host.online);
+      row.el.classList.toggle("offline", host.status === "offline");
+      row.el.classList.toggle("unused", host.status === "unused");
       this.columns.forEach((column, i) => {
         const cell = row.cells[i];
         if (!cell) return;

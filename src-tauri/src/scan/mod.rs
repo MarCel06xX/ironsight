@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::enrich::{oui, services};
 use crate::mac::MacAddr;
@@ -23,6 +23,31 @@ pub struct ScanConfig {
     pub concurrency: usize,
     /// Per-host answer timeout.
     pub timeout: Duration,
+    /// Reverse DNS also for addresses that did not answer.
+    pub resolve_offline_names: bool,
+}
+
+/// When reverse DNS runs for addresses that did not answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OfflineNames {
+    /// Only for scans of up to [`OfflineNames::AUTO_LIMIT`] addresses.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl OfflineNames {
+    pub const AUTO_LIMIT: usize = 1024;
+
+    pub fn enabled_for(self, targets: usize) -> bool {
+        match self {
+            Self::Auto => targets <= Self::AUTO_LIMIT,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -54,6 +79,7 @@ impl ScanConfig {
         Ok(Self {
             concurrency: concurrency as usize,
             timeout: Duration::from_millis(u64::from(timeout_ms)),
+            resolve_offline_names: false,
         })
     }
 }
@@ -67,7 +93,7 @@ pub struct SeenBy {
     pub tcp: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NameSource {
     Dns,
@@ -76,7 +102,7 @@ pub enum NameSource {
 }
 
 /// Every name found for a host, by source.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostNames {
     pub dns: Option<String>,
@@ -84,7 +110,7 @@ pub struct HostNames {
     pub netbios: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpInfo {
     pub status: Option<u16>,
@@ -110,6 +136,46 @@ impl ServiceInfo {
             http: None,
         }
     }
+}
+
+/// What is known about an address right now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostStatus {
+    /// Answered during this scan.
+    Online,
+    /// No answer, but data exists (DNS name, ARP cache entry or a known device).
+    Offline,
+    /// No answer and nothing known.
+    #[default]
+    Unused,
+}
+
+/// Where a displayed value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataSource {
+    /// Answer of the device during this scan.
+    Live,
+    /// Reverse DNS of an address that did not answer.
+    Dns,
+    /// OS neighbor cache.
+    ArpCache,
+    /// A device seen earlier (this session or a saved list).
+    Remembered,
+    /// A loaded previous scan.
+    Imported,
+}
+
+/// Source per field; `None` where the field is empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldSources {
+    pub hostname: Option<DataSource>,
+    pub mac: Option<DataSource>,
+    pub vendor: Option<DataSource>,
+    pub services: Option<DataSource>,
+    pub workgroup: Option<DataSource>,
 }
 
 /// Everything known about one scanned address. Sent once when the host has been probed
@@ -138,6 +204,11 @@ pub struct HostResult {
     pub services: Vec<ServiceInfo>,
     /// Unix time in milliseconds when the probe finished.
     pub timestamp_ms: u64,
+    pub status: HostStatus,
+    /// When the device was last seen online: now for online hosts, from the known-devices
+    /// list for remembered ones, unknown otherwise.
+    pub last_seen_ms: Option<u64>,
+    pub sources: FieldSources,
 }
 
 impl HostResult {
@@ -157,7 +228,43 @@ impl HostResult {
             workgroup: None,
             services: Vec::new(),
             timestamp_ms: 0,
+            status: HostStatus::Unused,
+            last_seen_ms: None,
+            sources: FieldSources::default(),
         }
+    }
+
+    /// Online if it answered; offline if any data exists; unused otherwise.
+    pub fn decide_status(&self) -> HostStatus {
+        if self.online {
+            HostStatus::Online
+        } else if self.hostname.is_some()
+            || self.mac.is_some()
+            || self.workgroup.is_some()
+            || !self.services.is_empty()
+        {
+            HostStatus::Offline
+        } else {
+            HostStatus::Unused
+        }
+    }
+
+    pub fn update_status(&mut self) {
+        self.status = self.decide_status();
+    }
+
+    /// For an online host: every present field is live data, seen right now.
+    pub fn mark_live(&mut self) {
+        let live = |present: bool| present.then_some(DataSource::Live);
+        self.sources = FieldSources {
+            hostname: live(self.hostname.is_some()),
+            mac: live(self.mac.is_some()),
+            vendor: live(self.vendor.is_some()),
+            services: live(!self.services.is_empty()),
+            workgroup: live(self.workgroup.is_some()),
+        };
+        self.last_seen_ms = Some(self.timestamp_ms);
+        self.update_status();
     }
 
     /// Sets the MAC address together with the vendor derived from it.
@@ -218,6 +325,53 @@ mod tests {
 
     fn host() -> HostResult {
         HostResult::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)))
+    }
+
+    #[test]
+    fn status_decision() {
+        let mut h = host();
+        assert_eq!(h.decide_status(), HostStatus::Unused);
+
+        // Any piece of data makes a silent address "offline".
+        let mut named = host();
+        named.hostname = Some("printer.lan".into());
+        assert_eq!(named.decide_status(), HostStatus::Offline);
+        let mut cached = host();
+        cached.set_mac(MacAddr([0x00, 0x00, 0x0c, 1, 2, 3]));
+        assert_eq!(cached.decide_status(), HostStatus::Offline);
+        let mut remembered = host();
+        remembered.services.push(ServiceInfo::open(80));
+        assert_eq!(remembered.decide_status(), HostStatus::Offline);
+        let mut grouped = host();
+        grouped.workgroup = Some("WORKGROUP".into());
+        assert_eq!(grouped.decide_status(), HostStatus::Offline);
+
+        // An answer always wins.
+        h.online = true;
+        assert_eq!(h.decide_status(), HostStatus::Online);
+    }
+
+    #[test]
+    fn live_hosts_mark_present_fields_as_live() {
+        let mut h = host();
+        h.online = true;
+        h.timestamp_ms = 42;
+        h.names.dns = Some("pc.lan".into());
+        h.pick_hostname();
+        h.mark_live();
+        assert_eq!(h.status, HostStatus::Online);
+        assert_eq!(h.last_seen_ms, Some(42));
+        assert_eq!(h.sources.hostname, Some(DataSource::Live));
+        assert_eq!(h.sources.mac, None);
+        assert_eq!(h.sources.services, None);
+    }
+
+    #[test]
+    fn offline_name_lookup_limit() {
+        assert!(OfflineNames::Auto.enabled_for(1024));
+        assert!(!OfflineNames::Auto.enabled_for(1025));
+        assert!(OfflineNames::Always.enabled_for(65_536));
+        assert!(!OfflineNames::Never.enabled_for(1));
     }
 
     #[test]

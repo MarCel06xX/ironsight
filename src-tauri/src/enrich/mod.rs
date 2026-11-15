@@ -77,6 +77,15 @@ impl HostProbes for NetEnricher {
         services::open_ports(ip, timeout).await
     }
 
+    async fn reverse_dns(&self, ip: IpAddr, timeout: Duration) -> Option<String> {
+        let timeout = timeout.clamp(MIN_LOOKUP_TIMEOUT, MAX_LOOKUP_TIMEOUT);
+        let v4 = match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        };
+        dns::reverse_lookup(ip, &self.dns_servers_for(v4), timeout).await
+    }
+
     async fn enrich(&self, mut host: HostResult, timeout: Duration) -> HostResult {
         let timeout = timeout.clamp(MIN_LOOKUP_TIMEOUT, MAX_LOOKUP_TIMEOUT);
         let ip = host.ip;
@@ -149,7 +158,7 @@ fn random_u16() -> u16 {
 /// Normalizes a string received from the network for display: control characters and
 /// whitespace runs become single spaces, invisible/bidi-override characters are dropped,
 /// and the result is trimmed and limited to `max_chars`. Empty results become `None`.
-fn clean_text(input: &str, max_chars: usize) -> Option<String> {
+pub(crate) fn clean_text(input: &str, max_chars: usize) -> Option<String> {
     let mut out = String::new();
     let mut chars = 0;
     let mut pending_space = false;

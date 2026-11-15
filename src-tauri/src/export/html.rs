@@ -5,8 +5,8 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use super::labels::Labels;
-use super::{ExportOptions, ScanInfo, Scope, source_key, status_key, time, web_info};
-use crate::scan::{HostResult, NameSource};
+use super::{ExportOptions, ScanInfo, Scope, source_key, sources_text, status_key, time, web_info};
+use crate::scan::{HostResult, HostStatus, NameSource};
 
 const STYLE: &str = r#"
 :root { color-scheme: light; }
@@ -25,7 +25,8 @@ table { border-collapse: collapse; }
 .hosts th, .hosts td { padding: 4px 8px; border-bottom: 1px solid #d5d9e0; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
 .hosts th { background: #eef1f5; font-weight: 600; white-space: nowrap; }
 .hosts tbody tr:nth-child(even) td { background: #f8f9fb; }
-.hosts tr.offline td { color: #8a92a0; }
+.hosts tr.offline td { color: #6b7380; }
+.hosts tr.unused td { color: #a0a7b3; }
 .dot { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: #a0a7b3; }
 .dot.on { background: #1f9d55; }
 footer { margin-top: 20px; font-size: 11px; }
@@ -160,12 +161,14 @@ pub fn write_html(
         "col.services",
         "col.web",
         "col.workgroup",
+        "col.lastSeen",
+        "export.col.source",
     ] {
         let _ = write!(html, "<th>{}</th>", escape(labels.get(key)));
     }
     html.push_str("</tr></thead>\n<tbody>\n");
     for host in hosts {
-        host_row(&mut html, host, labels);
+        host_row(&mut html, host, labels, offset);
     }
     html.push_str("</tbody></table>\n");
 
@@ -177,11 +180,11 @@ pub fn write_html(
     out.write_all(html.as_bytes())
 }
 
-fn host_row(html: &mut String, host: &HostResult, labels: &Labels) {
-    let class = if host.online {
-        ""
-    } else {
-        " class=\"offline\""
+fn host_row(html: &mut String, host: &HostResult, labels: &Labels, offset: i32) {
+    let class = match host.status {
+        HostStatus::Online => "",
+        HostStatus::Offline => " class=\"offline\"",
+        HostStatus::Unused => " class=\"unused\"",
     };
     let dot = if host.online { "dot on" } else { "dot" };
     let _ = write!(
@@ -247,7 +250,15 @@ fn host_row(html: &mut String, host: &HostResult, labels: &Labels) {
     if let Some(workgroup) = &host.workgroup {
         html.push_str(&escape(workgroup));
     }
-    html.push_str("</td></tr>\n");
+    html.push_str("</td><td>");
+    if let Some(seen) = host.last_seen_ms {
+        html.push_str(&escape(&time::readable(seen, offset)));
+    }
+    let _ = writeln!(
+        html,
+        "</td><td>{}</td></tr>",
+        escape(&sources_text(host, labels))
+    );
 }
 
 #[cfg(test)]
@@ -291,7 +302,7 @@ mod tests {
         assert!(html.contains("&lt;/td&gt;&lt;/tr&gt;"));
         assert!(html.contains("&quot;&gt;&lt;svg onload=alert(3)&gt;"));
         // Exactly one host row per host despite the injected row markup.
-        assert_eq!(html.matches("<tr class=\"offline\">").count(), 1);
+        assert_eq!(html.matches("<tr class=\"unused\">").count(), 1);
         assert_eq!(html.matches("<td><span class=\"dot").count(), 2);
     }
 

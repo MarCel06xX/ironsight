@@ -133,9 +133,15 @@ mod tests {
         assert_eq!(
             en.fill(
                 "scan.progress",
-                &[("scanned", "3"), ("total", "9"), ("online", "1")]
+                &[
+                    ("scanned", "3"),
+                    ("total", "9"),
+                    ("online", "1"),
+                    ("offline", "2"),
+                    ("unused", "6")
+                ]
             ),
-            "3/9 scanned, 1 online"
+            "3/9 scanned, 1 online, 2 offline, 6 unused"
         );
         // Unknown or unterminated placeholders stay as they are; values are not re-scanned.
         assert_eq!(en.fill("x {a} {b} {c", &[("a", "{b}")]), "x {b} {b} {c");

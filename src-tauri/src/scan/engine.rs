@@ -2,6 +2,7 @@
 //! live results. Independent of Tauri and of real network I/O (see [`NetBackend`] and
 //! [`HostProbes`]), so it can be tested with mocks.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +12,7 @@ use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::MissedTickBehavior;
 
 use super::range::TargetSet;
-use super::{HostResult, ScanBatch, ScanConfig, ScanSummary, SeenBy, ServiceInfo};
+use super::{DataSource, HostResult, ScanBatch, ScanConfig, ScanSummary, SeenBy, ServiceInfo};
 use crate::mac::MacAddr;
 use crate::platform::{Ipv4Net, NetBackend, NetError};
 
@@ -24,6 +25,8 @@ const MAX_BATCH: usize = 512;
 const MAX_ARP_THREADS: usize = 240;
 /// Safety net for waiting on an ARP call; the OS gives up well before this.
 const ARP_HARD_LIMIT: Duration = Duration::from_secs(5);
+/// Reverse DNS lookups for silent addresses running at the same time (spares the DNS server).
+const MAX_OFFLINE_DNS: usize = 32;
 
 /// Portable (socket-based) probing and enrichment, implemented by `enrich::NetEnricher`.
 pub trait HostProbes: Send + Sync + 'static {
@@ -36,6 +39,13 @@ pub trait HostProbes: Send + Sync + 'static {
         host: HostResult,
         timeout: Duration,
     ) -> impl Future<Output = HostResult> + Send;
+
+    /// Reverse DNS (PTR) name of an address, also if the device itself did not answer.
+    fn reverse_dns(
+        &self,
+        ip: IpAddr,
+        timeout: Duration,
+    ) -> impl Future<Output = Option<String>> + Send;
 }
 
 /// A local IPv4 subnet; hosts inside it can be resolved via ARP.
@@ -63,7 +73,9 @@ struct Shared<P> {
     links: Vec<LocalLink>,
     host_slots: Arc<Semaphore>,
     arp_slots: Arc<Semaphore>,
+    dns_slots: Arc<Semaphore>,
     timeout: Duration,
+    resolve_offline_names: bool,
     cancel: watch::Receiver<bool>,
 }
 
@@ -86,15 +98,20 @@ where
     let started_at_ms = now_ms();
     let total = targets.len() as u32;
     let concurrency = config.concurrency.max(1);
+    let neighbor_backend = Arc::clone(&backend);
     let shared = Arc::new(Shared {
         links: local_links(&backend).await,
         backend,
         probes,
         host_slots: Arc::new(Semaphore::new(concurrency)),
         arp_slots: Arc::new(Semaphore::new((concurrency * 3).min(MAX_ARP_THREADS))),
+        dns_slots: Arc::new(Semaphore::new(MAX_OFFLINE_DNS)),
         timeout: config.timeout,
+        resolve_offline_names: config.resolve_offline_names,
         cancel: cancel.clone(),
     });
+    // Latest state of every address that did not answer, for the neighbor cache step.
+    let mut silent: HashMap<IpAddr, HostResult> = HashMap::new();
 
     let (tx, mut rx) = mpsc::channel::<Update>(1024);
     let producer = tokio::spawn(produce(shared, targets, tx));
@@ -118,6 +135,14 @@ where
             update = rx.recv() => {
                 // The channel closes once the producer and all host tasks are done.
                 let Some(update) = update else { break };
+                let host = match &update {
+                    Update::Probed { host, .. } | Update::Changed { host, .. } => host,
+                };
+                if host.online {
+                    silent.remove(&host.ip);
+                } else {
+                    silent.insert(host.ip, host.clone());
+                }
                 match update {
                     Update::Probed { host, had_error } => {
                         scanned += 1;
@@ -141,6 +166,8 @@ where
             }
         }
     }
+    // Silent addresses the OS still knows from its neighbor (ARP) cache get MAC and vendor.
+    pending.extend(apply_neighbor_cache(&neighbor_backend, &mut silent).await);
     if !pending.is_empty() {
         flush(&mut pending, scanned, online);
     }
@@ -221,7 +248,8 @@ async fn probe_and_report<P: HostProbes>(
     if tx.send(first).await.is_err() || shared.is_cancelled() {
         return None;
     }
-    (host.online || arp.is_some()).then_some(FollowUp { host, arp, permit })
+    let wanted = host.online || arp.is_some() || shared.resolve_offline_names;
+    wanted.then_some(FollowUp { host, arp, permit })
 }
 
 impl FollowUp {
@@ -235,14 +263,34 @@ impl FollowUp {
         if !host.online {
             // Nothing answered within the timeout, but the OS is still asking via ARP
             // (sleeping phones often answer the second request). Waiting needs no slot.
+            // Meanwhile the DNS server may still know a name for the address.
             drop(permit);
-            let Some(mac) = late_arp(arp.take()).await else {
+            let name_lookup = async {
+                match shared.resolve_offline_names {
+                    true => shared.offline_name(host.ip).await,
+                    false => None,
+                }
+            };
+            let (late_mac, name) = tokio::join!(late_arp(arp.take()), name_lookup);
+            let Some(mac) = late_mac else {
+                if let Some(name) = name {
+                    host.names.dns = Some(name);
+                    host.pick_hostname();
+                    host.sources.hostname = Some(DataSource::Dns);
+                    host.update_status();
+                    let named = Update::Changed {
+                        host,
+                        became_online: false,
+                    };
+                    let _ = tx.send(named).await;
+                }
                 return;
             };
             host.online = true;
             host.complete = false;
             host.seen_by.arp = true;
             host.set_mac(mac);
+            host.mark_live();
             let revived = Update::Changed {
                 host: host.clone(),
                 became_online: true,
@@ -265,6 +313,7 @@ impl FollowUp {
             host.set_mac(mac);
         }
         host.complete = true;
+        host.mark_live();
         let enriched = Update::Changed {
             host,
             became_online: false,
@@ -280,7 +329,7 @@ async fn late_arp(handle: Option<ArpHandle>) -> Option<MacAddr> {
     result.ok()?.ok()?.ok()?
 }
 
-impl<P> Shared<P> {
+impl<P: HostProbes> Shared<P> {
     fn is_cancelled(&self) -> bool {
         *self.cancel.borrow()
     }
@@ -295,6 +344,12 @@ impl<P> Shared<P> {
             .iter()
             .find(|link| link.net.contains(ip))
             .map(|link| link.net.addr)
+    }
+
+    /// Reverse DNS for an address that did not answer, limited to a few lookups at a time.
+    async fn offline_name(&self, ip: IpAddr) -> Option<String> {
+        let _permit = Arc::clone(&self.dns_slots).acquire_owned().await.ok()?;
+        self.probes.reverse_dns(ip, self.timeout).await
     }
 
     /// Starts the blocking ARP call once a thread slot is free.
@@ -367,7 +422,39 @@ async fn discover<P: HostProbes>(
         host.set_mac(mac);
     }
     host.timestamp_ms = now_ms();
+    if host.online {
+        host.mark_live();
+    } else {
+        host.update_status();
+    }
     (host, had_error, arp_pending)
+}
+
+/// Fills MAC and vendor of silent addresses from the OS neighbor cache and returns the
+/// hosts that changed.
+async fn apply_neighbor_cache(
+    backend: &Arc<dyn NetBackend>,
+    silent: &mut HashMap<IpAddr, HostResult>,
+) -> Vec<HostResult> {
+    let backend = Arc::clone(backend);
+    let neighbors = match spawn_blocking(move || backend.neighbor_cache()).await {
+        Ok(Ok(neighbors)) => neighbors,
+        _ => return Vec::new(),
+    };
+    neighbors
+        .into_iter()
+        .filter_map(|neighbor| {
+            let host = silent.get_mut(&IpAddr::V4(neighbor.ip))?;
+            if host.mac.is_some() {
+                return None;
+            }
+            host.set_mac(neighbor.mac);
+            host.sources.mac = Some(DataSource::ArpCache);
+            host.sources.vendor = host.vendor.as_ref().map(|_| DataSource::ArpCache);
+            host.update_status();
+            Some(host.clone())
+        })
+        .collect()
 }
 
 async fn local_links(backend: &Arc<dyn NetBackend>) -> Vec<LocalLink> {
@@ -404,7 +491,8 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::platform::Adapter;
+    use crate::platform::{Adapter, Neighbor};
+    use crate::scan::HostStatus;
     use crate::scan::NameSource;
 
     const OWN_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -422,6 +510,7 @@ mod tests {
         arp_calls: Mutex<Vec<(Ipv4Addr, Option<Ipv4Addr>)>>,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        neighbors: Vec<Neighbor>,
     }
 
     impl NetBackend for MockBackend {
@@ -451,6 +540,10 @@ mod tests {
                 .then_some(MacAddr([2, 0, 0, 0, 0, last])))
         }
 
+        fn neighbor_cache(&self) -> Result<Vec<Neighbor>, NetError> {
+            Ok(self.neighbors.clone())
+        }
+
         fn icmp_ping(
             &self,
             target: IpAddr,
@@ -477,8 +570,11 @@ mod tests {
     #[derive(Default)]
     struct MockProbes {
         open: HashMap<Ipv4Addr, Vec<u16>>,
+        /// Reverse DNS answers.
+        ptr: HashMap<Ipv4Addr, String>,
         enrich_delay: Duration,
         enriched: Mutex<Vec<IpAddr>>,
+        ptr_lookups: Mutex<Vec<IpAddr>>,
     }
 
     impl HostProbes for MockProbes {
@@ -495,6 +591,14 @@ mod tests {
             host.names.dns = Some(format!("host-{}.lan", host.ip));
             host.pick_hostname();
             host
+        }
+
+        async fn reverse_dns(&self, ip: IpAddr, _timeout: Duration) -> Option<String> {
+            self.ptr_lookups.lock().unwrap().push(ip);
+            match ip {
+                IpAddr::V4(v4) => self.ptr.get(&v4).cloned(),
+                IpAddr::V6(_) => None,
+            }
         }
     }
 
@@ -529,6 +633,7 @@ mod tests {
             ScanConfig {
                 concurrency: 4,
                 timeout: TIMEOUT,
+                resolve_offline_names: true,
             },
             cancel_rx,
             7,
@@ -750,6 +855,7 @@ mod tests {
             ScanConfig {
                 concurrency: 4,
                 timeout: TIMEOUT,
+                resolve_offline_names: true,
             },
             cancel_rx,
             1,
@@ -814,5 +920,108 @@ mod tests {
         assert_eq!(summary.online, summary.scanned);
         // Hosts were reported, but none got as far as a finished enrichment.
         assert!(updates.iter().all(|h| h.online && h.hostname.is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn silent_addresses_get_reverse_dns_names() {
+        let backend = Arc::new(MockBackend {
+            icmp_hosts: [ip(5)].into(),
+            ..Default::default()
+        });
+        let probes = Arc::new(MockProbes {
+            ptr: [(ip(7), "printer.lan".to_string())].into(),
+            ..Default::default()
+        });
+        let (updates, summary) = scan_with(backend, Arc::clone(&probes), "10.0.0.5-8", None).await;
+
+        let named = host(&updates, ip(7));
+        assert!(!named.online);
+        assert_eq!(named.status, HostStatus::Offline);
+        assert_eq!(named.hostname.as_deref(), Some("printer.lan"));
+        assert_eq!(named.sources.hostname, Some(DataSource::Dns));
+        assert_eq!(named.last_seen_ms, None);
+
+        let unused = host(&updates, ip(8));
+        assert_eq!(unused.status, HostStatus::Unused);
+        assert_eq!(unused.hostname, None);
+
+        let live = host(&updates, ip(5));
+        assert_eq!(live.status, HostStatus::Online);
+        assert_eq!(live.sources.hostname, Some(DataSource::Live));
+        assert!(live.last_seen_ms.is_some());
+
+        // Online hosts are resolved by the enrichment, not by the offline lookup.
+        let mut looked_up = probes.ptr_lookups.lock().unwrap().clone();
+        looked_up.sort();
+        assert_eq!(looked_up, [6, 7, 8].map(|d| IpAddr::V4(ip(d))));
+        assert_eq!((summary.scanned, summary.online), (4, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offline_reverse_dns_can_be_switched_off() {
+        let probes = Arc::new(MockProbes {
+            ptr: [(ip(7), "printer.lan".to_string())].into(),
+            ..Default::default()
+        });
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&batches);
+        run_scan(
+            Arc::new(MockBackend::default()),
+            Arc::clone(&probes),
+            TargetSet::parse("10.0.0.7").unwrap(),
+            ScanConfig {
+                concurrency: 4,
+                timeout: TIMEOUT,
+                resolve_offline_names: false,
+            },
+            cancel_rx,
+            1,
+            move |batch: ScanBatch| sink.lock().unwrap().extend(batch.hosts),
+        )
+        .await;
+        drop(cancel_tx);
+        assert!(probes.ptr_lookups.lock().unwrap().is_empty());
+        let hosts = batches.lock().unwrap();
+        assert_eq!(hosts.last().unwrap().status, HostStatus::Unused);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn neighbor_cache_fills_mac_of_silent_addresses() {
+        let cached = MacAddr([0x00, 0x00, 0x0c, 0xaa, 0xbb, 0xcc]);
+        let backend = Arc::new(MockBackend {
+            icmp_hosts: [ip(5)].into(),
+            neighbors: vec![
+                // Silent address known to the cache.
+                Neighbor {
+                    ip: ip(9),
+                    mac: cached,
+                },
+                // Online host: its live data stays.
+                Neighbor {
+                    ip: ip(5),
+                    mac: MacAddr([0x00, 0x00, 0x0c, 1, 1, 1]),
+                },
+                // Outside the scanned range.
+                Neighbor {
+                    ip: ip(99),
+                    mac: cached,
+                },
+            ],
+            ..Default::default()
+        });
+        let (updates, _) = scan(backend, "10.0.0.5-10").await;
+
+        let from_cache = host(&updates, ip(9));
+        assert!(!from_cache.online);
+        assert_eq!(from_cache.mac, Some(cached));
+        assert!(from_cache.vendor.is_some());
+        assert_eq!(from_cache.sources.mac, Some(DataSource::ArpCache));
+        assert_eq!(from_cache.sources.vendor, Some(DataSource::ArpCache));
+        assert_eq!(from_cache.status, HostStatus::Offline);
+
+        assert_eq!(host(&updates, ip(5)).mac, None);
+        assert_eq!(host(&updates, ip(10)).status, HostStatus::Unused);
+        assert!(reports(&updates, ip(99)).is_empty());
     }
 }

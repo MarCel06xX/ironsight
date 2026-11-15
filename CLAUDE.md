@@ -6,12 +6,10 @@ Windows only. Port scanning / packet capture / Linux come later – keep platfor
 
 ## Current phase
 
-**All 5 phases done - v0.1.0 released** (README en/de, app icon, NSIS installer, GitHub release).
-Next: whatever the user asks for (ideas: screenshots in `docs/`, code signing, HTTPS titles
-(needs a TLS crate - ask), port scanning, packet capture, Linux backend).
-
-Phases: 0 scaffold · 1 backend core · 2 enrichment · 3 UI · 4 export · 5 polish/release.
-After each phase: fmt + clippy + tests, commit, push, short summary, **wait for the user's OK**.
+**v0.2.0 (offline devices) implemented, not yet released** - wait for the user's OK before
+running `scripts/release.ps1`. Released so far: v0.1.0-v0.1.3 (updater tested end to end).
+Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), port
+scanning, packet capture, Linux backend.
 
 ## Rules
 
@@ -158,6 +156,24 @@ can no longer update.
   exports); a test renders every format in both languages and fails on raw keys/placeholders.
 - `time.rs`: self-written civil-date conversion (no chrono). Settings now also store
   `csvDelimiter` (remembered from the last CSV export).
+
+## Offline devices and known devices (v0.2.0)
+
+- `HostResult.status` online/offline/unused (`decide_status`: offline = silent but any data),
+  `last_seen_ms`, `sources` (per field: live, dns, arpCache, remembered, imported).
+- Engine: reverse DNS also for silent addresses (`ScanConfig.resolve_offline_names`, setting
+  `offlineNames` auto = up to 1,024 targets; max 32 lookups at a time), then
+  `NetBackend::neighbor_cache` (`GetIpNetTable2`, filtered by `usable_neighbor`) fills MAC/vendor
+  of silent addresses at scan end.
+- `known.rs` `KnownDevices`: remembered (session; opt-in file `known-devices.json` in app data
+  dir / `ironsight-known-devices.json` next to the portable exe) + imported (JSON export v1/v2,
+  untrusted, sanitized). Key MAC, else IP; recording an IP removes it from other devices; a
+  device online elsewhere in this scan is not shown at its old IP; a cache MAC only matches that
+  MAC. `apply_known` merges known data into silent hosts.
+- `commands::ScanRecord` keeps the engine's hosts (without known data) + live set; known data is
+  applied at scan end (`finish_known` -> one extra `scan:batch` before `scan:finished`), on
+  import/forget (`KnownUpdate.hosts`) and in exports. Lock order: `known` before `last_scan`.
+- `save_settings`: remember on -> write file, off -> delete it.
 
 ## Commands
 

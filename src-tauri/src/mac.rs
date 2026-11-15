@@ -3,7 +3,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MacAddr(pub [u8; 6]);
@@ -49,6 +49,13 @@ impl FromStr for MacAddr {
 impl Serialize for MacAddr {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for MacAddr {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
     }
 }
 

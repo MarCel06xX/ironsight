@@ -1,8 +1,8 @@
 // Details panel for the selected host. Built with DOM APIs only: most values are
 // untrusted network data.
-import type { HostResult, NameSource, ServiceInfo } from "./api";
-import { rttText, sourceLabel, statusKey } from "./format";
-import { type MessageKey, formatDateTime, t } from "./i18n";
+import type { DataSource, HostResult, NameSource, ServiceInfo } from "./api";
+import { originLabel, rttText, sourceLabel, statusClass, statusKey } from "./format";
+import { type MessageKey, formatDateTime, formatRelative, t } from "./i18n";
 
 const NAME_SOURCES: readonly NameSource[] = ["dns", "mdns", "netbios"];
 
@@ -20,9 +20,15 @@ function el<K extends keyof HTMLElementTagNameMap>(
 function statusNode(host: HostResult): HTMLElement {
   const wrapper = document.createElement("span");
   const dot = document.createElement("span");
-  dot.className = `dot ${!host.online ? "offline" : host.complete ? "online" : "pending"}`;
+  dot.className = `dot ${statusClass(host)}`;
   wrapper.append(dot, document.createTextNode(t(statusKey(host))));
   return wrapper;
+}
+
+/** "Source: ARP cache" for data that did not come from the device just now. */
+function sourceNotes(source: DataSource | null): HTMLElement[] {
+  if (source === null || source === "live") return [];
+  return [el("div", t("details.fieldSource", { source: originLabel(source) }), "note")];
 }
 
 function serviceNode(service: ServiceInfo): HTMLElement {
@@ -57,23 +63,30 @@ export function renderDetails(panel: HTMLElement, host: HostResult | undefined, 
     for (const value of values) dd.append(typeof value === "string" ? el("div", value) : value);
     list.append(el("dt", t(label)), dd);
   };
+  const sources = host.sources;
 
   add("details.status", [statusNode(host)]);
   add("details.ip", [host.ip]);
-  add(
-    "details.names",
-    NAME_SOURCES.flatMap((source) => {
-      const name = host.names[source];
-      return name ? [`${sourceLabel(source)}: ${name}`] : [];
-    }),
-  );
+  if (host.lastSeenMs !== null) {
+    const seen = host.lastSeenMs;
+    add("details.lastOnline", [`${formatDateTime(seen)} (${formatRelative(seen)})`]);
+  } else if (!host.online) {
+    add("details.lastOnline", [t("details.neverOnline")]);
+  }
+  const names = NAME_SOURCES.flatMap((source) => {
+    const name = host.names[source];
+    return name ? [`${sourceLabel(source)}: ${name}`] : [];
+  });
+  if (names.length > 0) add("details.names", [...names, ...sourceNotes(sources.hostname)]);
   if (host.mac !== null) {
     const note = host.macLocal ? [el("div", t("details.macLocal"), "note")] : [];
-    add("details.mac", [host.mac, ...note]);
+    add("details.mac", [host.mac, ...note, ...sourceNotes(sources.mac)]);
   }
-  if (host.vendor !== null) add("details.vendor", [host.vendor]);
+  if (host.vendor !== null) add("details.vendor", [host.vendor, ...sourceNotes(sources.vendor)]);
   if (host.rttMs !== null) add("details.rtt", [rttText(host)]);
-  if (host.workgroup !== null) add("details.workgroup", [host.workgroup]);
+  if (host.workgroup !== null) {
+    add("details.workgroup", [host.workgroup, ...sourceNotes(sources.workgroup)]);
+  }
 
   const seenBy: string[] = [];
   if (isOwn) seenBy.push(t("seenBy.self"));
@@ -82,9 +95,10 @@ export function renderDetails(panel: HTMLElement, host: HostResult | undefined, 
   if (host.seenBy.tcp) seenBy.push(t("seenBy.tcp"));
   if (seenBy.length > 0) add("details.seenBy", [seenBy.join(", ")]);
 
-  if (host.online) {
-    const services = host.services.map(serviceNode);
-    add("details.services", services.length > 0 ? services : [t("details.noServices")]);
+  if (host.services.length > 0) {
+    add("details.services", [...host.services.map(serviceNode), ...sourceNotes(sources.services)]);
+  } else if (host.online) {
+    add("details.services", [t("details.noServices")]);
   }
   if (host.timestampMs > 0) add("details.lastSeen", [formatDateTime(host.timestampMs)]);
   panel.append(list);
