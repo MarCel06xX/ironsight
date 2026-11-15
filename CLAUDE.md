@@ -6,8 +6,8 @@ Windows only. Port scanning / packet capture / Linux come later – keep platfor
 
 ## Current phase
 
-**v0.2.0 (offline devices) implemented, not yet released** - wait for the user's OK before
-running `scripts/release.ps1`. Released so far: v0.1.0-v0.1.3 (updater tested end to end).
+**v0.2.0 released** (offline devices, known devices, three states). Released: v0.1.0-v0.1.3, v0.2.0;
+the updater was tested end to end (0.1.2 -> 0.1.3). Releases only after the user's OK.
 Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), port
 scanning, packet capture, Linux backend.
 
