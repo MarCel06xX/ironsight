@@ -10,7 +10,7 @@ export type SortKey =
   | "mac"
   | "vendor"
   | "rtt"
-  | "services"
+  | "ports"
   | "web"
   | "workgroup"
   | "lastSeen";
@@ -20,6 +20,36 @@ interface Entry {
   ipKey: number;
   /** Lower-cased text the filter matches against. */
   search: string;
+  /** Open ports, for `port:22` filters. */
+  ports: ReadonlySet<number>;
+}
+
+/** Filter input split into `port:N` conditions and the remaining text. */
+interface Filter {
+  text: string;
+  ports: number[];
+  /** A `port:` condition that is not a port number: nothing matches. */
+  invalid: boolean;
+}
+
+const PORT_TERM = /(^|\s)port:(\S*)/gi;
+
+/** `port:22 port:80 ssh` -> hosts with 22 and 80 open whose text contains "ssh". */
+export function parseFilter(input: string): Filter {
+  const ports: number[] = [];
+  let invalid = false;
+  const text = input
+    .replace(PORT_TERM, (_match, before: string, value: string) => {
+      const port = /^\d{1,5}$/.test(value) ? Number(value) : 0;
+      if (port >= 1 && port <= 65_535) ports.push(port);
+      else invalid = true;
+      return before;
+    })
+    // "a port:22 b" leaves two spaces behind.
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  return { text, ports, invalid };
 }
 
 type Compare = (a: Entry, b: Entry) => number;
@@ -38,7 +68,7 @@ function searchText(host: HostResult): string {
   ];
   for (const service of host.services) {
     parts.push(String(service.port), service.name, service.http?.server ?? null);
-    parts.push(service.http?.title ?? null);
+    parts.push(service.http?.title ?? null, service.banner);
   }
   return parts
     .filter((part): part is string => part !== null && part !== "")
@@ -59,7 +89,8 @@ export class HostStore {
   private readonly entries = new Map<string, Entry>();
   private view: HostResult[] | null = null;
   private collator = makeCollator();
-  private filter = "";
+  private filterInput = "";
+  private filter: Filter = { text: "", ports: [], invalid: false };
   /** Statuses shown in the table; unused addresses are hidden by default. */
   private readonly visible = new Set<HostStatus>(["online", "offline"]);
   private readonly counts: Record<HostStatus, number> = { online: 0, offline: 0, unused: 0 };
@@ -84,7 +115,12 @@ export class HostStore {
       const previous = this.entries.get(host.ip);
       if (previous) this.counts[previous.host.status] -= 1;
       this.counts[host.status] += 1;
-      this.entries.set(host.ip, { host, ipKey: ipSortKey(host.ip), search: searchText(host) });
+      this.entries.set(host.ip, {
+        host,
+        ipKey: ipSortKey(host.ip),
+        search: searchText(host),
+        ports: new Set(host.services.map((service) => service.port)),
+      });
     }
     if (hosts.length > 0) this.view = null;
   }
@@ -115,9 +151,10 @@ export class HostStore {
   }
 
   setFilter(text: string): void {
-    const filter = text.trim().toLowerCase();
-    if (filter !== this.filter) {
-      this.filter = filter;
+    const input = text.trim().toLowerCase();
+    if (input !== this.filterInput) {
+      this.filterInput = input;
+      this.filter = parseFilter(input);
       this.view = null;
     }
   }
@@ -147,9 +184,12 @@ export class HostStore {
 
   private compute(): HostResult[] {
     const matches: Entry[] = [];
+    const { text, ports, invalid } = this.filter;
+    if (invalid) return [];
     for (const entry of this.entries.values()) {
       if (!this.visible.has(entry.host.status)) continue;
-      if (this.filter !== "" && !entry.search.includes(this.filter)) continue;
+      if (text !== "" && !entry.search.includes(text)) continue;
+      if (!ports.every((port) => entry.ports.has(port))) continue;
       matches.push(entry);
     }
     matches.sort(this.comparator());
@@ -191,8 +231,9 @@ export class HostStore {
         return byText((host) => host.vendor);
       case "rtt":
         return byNumber((host) => host.rttMs);
-      case "services":
-        return byNumber((host) => host.services.length || null);
+      case "ports":
+        // Port-scanned hosts without open ports (0) sort before hosts that were not scanned.
+        return byNumber((host) => host.services.length || (host.portScan ? 0 : null));
       case "web":
         return byText(webText);
       case "workgroup":

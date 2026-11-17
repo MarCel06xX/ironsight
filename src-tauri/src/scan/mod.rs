@@ -150,6 +150,8 @@ impl ServiceInfo {
 pub struct ListedPort {
     pub port: u16,
     pub state: PortState,
+    /// Service usually found on this port (display only).
+    pub name: &'static str,
 }
 
 /// Port scan of one host. Open ports are in [`HostResult::services`].
@@ -392,6 +394,7 @@ impl HostResult {
                 .map(|entry| ListedPort {
                     port: entry.port,
                     state: entry.state,
+                    name: services::service_name(entry.port),
                 })
                 .collect(),
         });
@@ -626,11 +629,13 @@ mod tests {
             [
                 ListedPort {
                     port: 23,
-                    state: PortState::Closed
+                    state: PortState::Closed,
+                    name: "telnet",
                 },
                 ListedPort {
                     port: 8000,
-                    state: PortState::Filtered
+                    state: PortState::Filtered,
+                    name: "http-alt",
                 },
             ]
         );

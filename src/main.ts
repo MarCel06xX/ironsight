@@ -5,6 +5,8 @@ import {
   type HostResult,
   type HostStatus,
   type KnownUpdate,
+  type PortsBatch,
+  type PortsFinished,
   type ScanBatch,
   type ScanSummary,
   type Settings,
@@ -14,12 +16,15 @@ import {
   isCommandError,
   listAdapters,
   loadSettings,
+  onPortsBatch,
+  onPortsFinished,
   onScanBatch,
   onScanFinished,
   openFileShare,
   openInBrowser,
   openRemoteDesktop,
   saveSettings,
+  scanHostPorts,
   startScan,
   stopScan,
   wakeOnLan,
@@ -28,8 +33,8 @@ import { renderDetails } from "./details";
 import { ExportDialog } from "./export";
 import {
   hostnameText,
+  openPortsText,
   rttText,
-  servicesText,
   statusClass,
   statusKey,
   vendorText,
@@ -49,6 +54,7 @@ import {
   t,
 } from "./i18n";
 import { ContextMenu, type MenuItem } from "./menu";
+import { HostPortsDialog, NoticeDialog, portOptions, settingsSelection } from "./ports";
 import { SettingsDialog } from "./settings";
 import { HostStore, type SortKey } from "./store";
 import { type Column, VirtualTable } from "./table";
@@ -66,6 +72,14 @@ const DEFAULT_SETTINGS: Settings = {
   skippedVersion: null,
   offlineNames: "auto",
   rememberDevices: false,
+  portScan: false,
+  portPreset: "common",
+  portCustom: "",
+  portTimeoutMs: 1000,
+  portConcurrency: 256,
+  portMaxProbes: 1_000_000,
+  banners: true,
+  portNoticeAccepted: false,
 };
 /** Relative "last seen" times are refreshed this often. */
 const RELATIVE_TIME_REFRESH_MS = 60_000;
@@ -100,13 +114,33 @@ const shownCount = byId<HTMLSpanElement>("shown-count");
 const detailsPanel = byId<HTMLElement>("details");
 
 type ScanStatus = "ready" | "running" | "done" | "stopped";
+/** A network scan (with an optional port step) or "Scan ports…" for one host. */
+type ScanMode = "network" | "hostPorts";
 
 const store = new HostStore();
 const toast = new Toast(byId("toast"));
 const menu = new ContextMenu(byId("context-menu"));
+const hostPortsDialog = new HostPortsDialog(byId("host-ports-dialog"), (error) =>
+  errorText(error),
+);
+const noticeDialog = new NoticeDialog(byId("notice-dialog"));
 /** IPv4 addresses of this machine, to label its own row. */
 const ownAddresses = new Set<string>();
-const progress = { scanned: 0, total: 0, online: 0, status: "ready" as ScanStatus };
+const progress = {
+  scanned: 0,
+  total: 0,
+  online: 0,
+  status: "ready" as ScanStatus,
+  mode: "network" as ScanMode,
+  /** Checks of the port step or the host port scan; `null` if none ran. */
+  ports: null as { done: number; total: number } | null,
+  /** The port step was stopped (the network scan itself had finished). */
+  portsStopped: false,
+  /** Address of a "Scan ports…" run. */
+  hostIp: "",
+};
+/** Open ports per host reported by the current port scan. */
+const openPorts = new Map<string, number>();
 
 let settings: Settings = DEFAULT_SETTINGS;
 let running = false;
@@ -148,7 +182,7 @@ const columns: Column[] = [
   textColumn("mac", "col.mac", (host) => host.mac ?? ""),
   textColumn("vendor", "col.vendor", vendorText),
   textColumn("rtt", "col.rtt", rttText),
-  textColumn("services", "col.services", servicesText),
+  textColumn("ports", "col.openPorts", (host) => openPortsText(host, running)),
   textColumn("web", "col.web", (host) => webText(host) ?? ""),
   textColumn("workgroup", "col.workgroup", (host) => host.workgroup ?? ""),
   textColumn("lastSeen", "col.lastSeen", (host) =>
@@ -293,6 +327,12 @@ function openHostMenu(ip: string, x: number, y: number): void {
     { label: t("menu.rdp"), run: () => runAction(() => openRemoteDesktop(ip)) },
     { label: t("menu.share"), run: () => runAction(() => openFileShare(ip)) },
     {
+      label: t("menu.scanPorts"),
+      separatorBefore: true,
+      disabled: running,
+      run: () => scanPortsOf(ip),
+    },
+    {
       label: t("menu.wol"),
       separatorBefore: true,
       disabled: mac === null,
@@ -321,23 +361,52 @@ function setRunning(value: boolean): void {
   exportButton.disabled = value || store.total === 0;
   importButton.disabled = value;
   renderScanButton();
+  // The "Open ports" column marks hosts whose port scan is running.
+  table.invalidate();
+}
+
+function openPortTotal(): number {
+  let total = 0;
+  for (const count of openPorts.values()) total += count;
+  return total;
+}
+
+function setBar(value: number, max: number): void {
+  progressBar.max = Math.max(max, 1);
+  progressBar.value = value;
 }
 
 function renderProgress(): void {
-  const { scanned, total, online, status } = progress;
-  progressBar.max = Math.max(total, 1);
-  progressBar.value = scanned;
+  const { scanned, total, online, status, ports } = progress;
   if (status === "ready") {
+    setBar(0, 1);
     progressText.textContent = t("scan.status.ready");
     return;
   }
-  const counts = t("scan.progress", {
-    scanned: formatNumber(scanned),
-    total: formatNumber(total),
-    online: formatNumber(Math.max(online, store.count("online"))),
-    offline: formatNumber(store.count("offline")),
-    unused: formatNumber(store.count("unused")),
-  });
+  const open = formatNumber(openPortTotal());
+  const checks = ports ?? { done: 0, total: 0 };
+  const checkCounts = { done: formatNumber(checks.done), total: formatNumber(checks.total), open };
+  let counts: string;
+  if (progress.mode === "hostPorts") {
+    setBar(checks.done, checks.total);
+    counts =
+      status === "running"
+        ? t("scan.hostPortsProgress", { ip: progress.hostIp, ...checkCounts })
+        : t("scan.hostPortsDone", { ip: progress.hostIp, open });
+  } else if (status === "running" && ports !== null) {
+    setBar(checks.done, checks.total);
+    counts = t("scan.portsProgress", checkCounts);
+  } else {
+    setBar(scanned, total);
+    counts = t("scan.progress", {
+      scanned: formatNumber(scanned),
+      total: formatNumber(total),
+      online: formatNumber(Math.max(online, store.count("online"))),
+      offline: formatNumber(store.count("offline")),
+      unused: formatNumber(store.count("unused")),
+    });
+    if (ports !== null) counts += ` – ${t("scan.portsSummary", { open })}`;
+  }
   const prefix: Record<ScanStatus, MessageKey | null> = {
     ready: null,
     running: null,
@@ -352,14 +421,25 @@ async function toggleScan(): Promise<void> {
   lastError = null;
   renderError();
   if (running) {
-    stopping = true; // the button comes back with `scan:finished`
+    stopping = true; // the button comes back with `scan:finished` (or `ports:finished`)
     renderScanButton();
     await stopScan().catch(showError);
     return;
   }
+  if (settings.portScan && !(await confirmPortNotice())) return;
+  if (running) return; // started from elsewhere while the notice was open
   store.clear();
   selectHost(null);
-  Object.assign(progress, { scanned: 0, total: 0, online: 0, status: "running" });
+  openPorts.clear();
+  Object.assign(progress, {
+    scanned: 0,
+    total: 0,
+    online: 0,
+    status: "running",
+    mode: "network",
+    ports: null,
+    portsStopped: false,
+  });
   setRunning(true);
   renderProgress();
   refreshView();
@@ -369,6 +449,8 @@ async function toggleScan(): Promise<void> {
       concurrency: settings.concurrency,
       timeoutMs: settings.timeoutMs,
       offlineNames: settings.offlineNames,
+      banners: settings.banners,
+      ports: settings.portScan ? portOptions(settings, settingsSelection(settings)) : null,
     });
     // Batches may already have arrived; only fill in the total if none did.
     if (progress.total === 0) {
@@ -399,8 +481,86 @@ function handleFinished(summary: ScanSummary): void {
     scanned: summary.scanned,
     total: summary.total,
     online: summary.online,
-    status: summary.cancelled ? "stopped" : "done",
+    status: summary.cancelled || progress.portsStopped ? "stopped" : "done",
   });
+  setRunning(false);
+  renderProgress();
+  refreshView();
+}
+
+// --- port scans --------------------------------------------------------------------------
+
+/** Shows the one-time notice; `true` if it was (or had been) acknowledged. */
+async function confirmPortNotice(): Promise<boolean> {
+  if (settings.portNoticeAccepted) return true;
+  if (!(await noticeDialog.ask())) return false;
+  settings = { ...settings, portNoticeAccepted: true };
+  saveSettings(settings).catch((error: unknown) => toast.show(errorText(error), "error"));
+  return true;
+}
+
+/** "Scan ports…" from the context menu. */
+async function scanPortsOf(ip: string): Promise<void> {
+  if (running) return;
+  const selection = await hostPortsDialog.open(ip, settings);
+  if (selection === null || running) return;
+  if (!(await confirmPortNotice()) || running) return;
+  lastError = null;
+  renderError();
+  const previous = { ...progress };
+  openPorts.clear();
+  Object.assign(progress, {
+    status: "running",
+    mode: "hostPorts",
+    ports: { done: 0, total: 0 },
+    portsStopped: false,
+    hostIp: ip,
+  });
+  setRunning(true);
+  renderProgress();
+  try {
+    const started = await scanHostPorts({
+      ip,
+      ports: portOptions(settings, selection),
+      banners: settings.banners,
+    });
+    // Batches may already have arrived; only fill in the total if none did.
+    if (progress.ports !== null && progress.ports.total === 0) {
+      progress.ports = { done: progress.ports.done, total: started.total };
+      renderProgress();
+    }
+  } catch (error) {
+    Object.assign(progress, previous);
+    setRunning(false);
+    renderProgress();
+    showError(error);
+  }
+}
+
+function handlePortsBatch(batch: PortsBatch): void {
+  if (batch.scanId <= lastFinishedScanId) return;
+  store.upsert(batch.hosts);
+  for (const host of batch.hosts) openPorts.set(host.ip, host.portScan?.open ?? 0);
+  progress.ports = { done: batch.done, total: batch.total };
+  renderProgress();
+  scheduleRefresh();
+}
+
+function handlePortsFinished(finished: PortsFinished): void {
+  if (finished.scanId <= lastFinishedScanId) return;
+  if (finished.error) showError(finished.error);
+  const summary = finished.summary;
+  if (summary) {
+    progress.ports = { done: summary.done, total: summary.total };
+    progress.portsStopped = summary.cancelled;
+  }
+  if (progress.mode !== "hostPorts") {
+    // The network scan reports its own end right after this.
+    renderProgress();
+    return;
+  }
+  lastFinishedScanId = Math.max(lastFinishedScanId, finished.scanId);
+  progress.status = summary && !summary.cancelled ? "done" : "stopped";
   setRunning(false);
   renderProgress();
   refreshView();
@@ -613,6 +773,8 @@ async function init(): Promise<void> {
 
   await onScanBatch(handleBatch);
   await onScanFinished(handleFinished);
+  await onPortsBatch(handlePortsBatch);
+  await onPortsFinished(handlePortsFinished);
   await loadAdapters();
   window.setTimeout(() => void startupUpdateCheck(), UPDATE_CHECK_DELAY_MS);
 }

@@ -592,6 +592,23 @@ async fn run_ports(
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortListInfo {
+    normalized: String,
+    count: u32,
+}
+
+/// Checks a custom port list with the scan's own parser (inline feedback in the UI).
+#[tauri::command]
+pub fn check_port_list(spec: String) -> Result<PortListInfo, CommandError> {
+    let set = PortSet::parse(&spec)?;
+    Ok(PortListInfo {
+        normalized: set.to_string(),
+        count: u32::try_from(set.len()).unwrap_or(u32::MAX),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostPortsRequest {
@@ -1177,6 +1194,16 @@ mod tests {
         assert_eq!(code(r#"{"selection":{"preset":"common"},"x":1}"#), "json");
         assert_eq!(code(r#"{"selection":{"preset":"top5"}}"#), "json");
         assert_eq!(code(r#"{}"#), "json");
+    }
+
+    #[test]
+    fn port_list_check() {
+        let info = check_port_list(" 443,22, 80-82 ".into()).unwrap();
+        assert_eq!((info.normalized.as_str(), info.count), ("22,80-82,443", 5));
+        let error = check_port_list("22,".into()).unwrap_err();
+        assert_eq!(error.code, "ports.empty_entry");
+        let error = check_port_list("x".repeat(5000)).unwrap_err();
+        assert_eq!(error.code, "ports.input_too_long");
     }
 
     #[test]

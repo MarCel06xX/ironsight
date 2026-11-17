@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CommandError;
 use crate::export::Delimiter;
+use crate::ports::scanner::{self, PortScanConfig};
+use crate::ports::spec::{MAX_SPEC_LEN, PortSet, PortSpecError};
 use crate::scan::{DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, OfflineNames, ScanConfig};
 
 pub const FILE_NAME: &str = "settings.json";
@@ -35,6 +37,18 @@ pub enum Language {
     De,
 }
 
+/// Port list chosen in the settings: a preset, or the custom list in `port_custom`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PortChoice {
+    #[default]
+    Common,
+    Top100,
+    Top1000,
+    All,
+    Custom,
+}
+
 /// Missing fields (older files) take their default value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -53,6 +67,19 @@ pub struct Settings {
     pub offline_names: OfflineNames,
     /// Save known devices to disk (opt-in; off: memory only).
     pub remember_devices: bool,
+    /// Port scan of the hosts that answered, after host discovery (opt-in).
+    pub port_scan: bool,
+    pub port_preset: PortChoice,
+    /// Custom port list, used with [`PortChoice::Custom`]; kept when another preset is chosen.
+    pub port_custom: String,
+    pub port_timeout_ms: u32,
+    pub port_concurrency: u32,
+    /// Port scans with more probes (hosts x ports) are refused.
+    pub port_max_probes: u64,
+    /// Read banners and HTTP titles of open ports.
+    pub banners: bool,
+    /// The one-time notice "only scan networks you may scan" was acknowledged.
+    pub port_notice_accepted: bool,
 }
 
 impl Default for Settings {
@@ -67,8 +94,27 @@ impl Default for Settings {
             skipped_version: None,
             offline_names: OfflineNames::Auto,
             remember_devices: false,
+            port_scan: false,
+            port_preset: PortChoice::Common,
+            port_custom: String::new(),
+            port_timeout_ms: scanner::DEFAULT_TIMEOUT_MS,
+            port_concurrency: scanner::DEFAULT_CONCURRENCY,
+            port_max_probes: scanner::DEFAULT_MAX_PROBES,
+            banners: true,
+            port_notice_accepted: false,
         }
     }
+}
+
+/// Port scan limits as stored; the per-host limit is not a setting.
+fn port_config(timeout_ms: u32, concurrency: u32, max_probes: u64) -> bool {
+    PortScanConfig::new(
+        timeout_ms,
+        concurrency,
+        scanner::DEFAULT_PER_HOST,
+        max_probes,
+    )
+    .is_ok()
 }
 
 /// Version strings like `1.2.3` or `1.2.3-beta.1`, nothing else.
@@ -82,6 +128,18 @@ fn is_version(value: &str) -> bool {
 impl Settings {
     pub fn validate(&self) -> Result<(), CommandError> {
         ScanConfig::new(self.concurrency, self.timeout_ms)?;
+        PortScanConfig::new(
+            self.port_timeout_ms,
+            self.port_concurrency,
+            scanner::DEFAULT_PER_HOST,
+            self.port_max_probes,
+        )?;
+        if self.port_custom.len() > MAX_SPEC_LEN {
+            return Err(PortSpecError::InputTooLong.into());
+        }
+        if self.port_preset == PortChoice::Custom {
+            PortSet::parse(&self.port_custom)?;
+        }
         if self
             .skipped_version
             .as_deref()
@@ -110,6 +168,36 @@ impl Settings {
         }
         if ScanConfig::new(defaults.concurrency, settings.timeout_ms).is_err() {
             settings.timeout_ms = defaults.timeout_ms;
+        }
+        let d = &defaults;
+        if !port_config(
+            settings.port_timeout_ms,
+            d.port_concurrency,
+            d.port_max_probes,
+        ) {
+            settings.port_timeout_ms = d.port_timeout_ms;
+        }
+        if !port_config(
+            d.port_timeout_ms,
+            settings.port_concurrency,
+            d.port_max_probes,
+        ) {
+            settings.port_concurrency = d.port_concurrency;
+        }
+        if !port_config(
+            d.port_timeout_ms,
+            d.port_concurrency,
+            settings.port_max_probes,
+        ) {
+            settings.port_max_probes = d.port_max_probes;
+        }
+        if settings.port_custom.len() > MAX_SPEC_LEN {
+            settings.port_custom = String::new();
+        }
+        if settings.port_preset == PortChoice::Custom
+            && PortSet::parse(&settings.port_custom).is_err()
+        {
+            settings.port_preset = PortChoice::Common;
         }
         if settings
             .skipped_version
@@ -173,6 +261,14 @@ mod tests {
             skipped_version: Some("0.2.0".into()),
             offline_names: OfflineNames::Never,
             remember_devices: true,
+            port_scan: true,
+            port_preset: PortChoice::Custom,
+            port_custom: "22,80,1000-2000".into(),
+            port_timeout_ms: 750,
+            port_concurrency: 512,
+            port_max_probes: 2_000_000,
+            banners: false,
+            port_notice_accepted: true,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -202,7 +298,15 @@ mod tests {
                 "checkUpdates": true,
                 "skippedVersion": null,
                 "offlineNames": "auto",
-                "rememberDevices": false
+                "rememberDevices": false,
+                "portScan": false,
+                "portPreset": "common",
+                "portCustom": "",
+                "portTimeoutMs": 1000,
+                "portConcurrency": 256,
+                "portMaxProbes": 1_000_000,
+                "banners": true,
+                "portNoticeAccepted": false
             })
         );
     }
@@ -260,6 +364,26 @@ mod tests {
         assert_eq!(loaded.language, Language::En);
         assert_eq!(loaded.concurrency, DEFAULT_CONCURRENCY);
         assert_eq!(loaded.timeout_ms, DEFAULT_TIMEOUT_MS);
+
+        // Port settings: each bad value is reset on its own.
+        fs::write(
+            &path,
+            r#"{"portScan":true,"portTimeoutMs":5,"portConcurrency":4096,"portMaxProbes":0,"portPreset":"custom","portCustom":"22,,80"}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&path);
+        let defaults = Settings::default();
+        assert!(loaded.port_scan);
+        assert_eq!(loaded.port_timeout_ms, defaults.port_timeout_ms);
+        assert_eq!(loaded.port_concurrency, defaults.port_concurrency);
+        assert_eq!(loaded.port_max_probes, defaults.port_max_probes);
+        // An invalid custom list falls back to the default preset but is kept for editing.
+        assert_eq!(loaded.port_preset, PortChoice::Common);
+        assert_eq!(loaded.port_custom, "22,,80");
+
+        let huge = format!(r#"{{"portCustom":"{}"}}"#, "1".repeat(MAX_SPEC_LEN + 1));
+        fs::write(&path, huge).unwrap();
+        assert_eq!(Settings::load(&path).port_custom, "");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -277,6 +401,35 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(code(bad), ConfigError::Timeout.code());
+
+        let bad = Settings {
+            port_timeout_ms: 20_000,
+            ..Settings::default()
+        };
+        assert_eq!(code(bad), "ports.invalid_timeout");
+        let bad = Settings {
+            port_concurrency: 0,
+            ..Settings::default()
+        };
+        assert_eq!(code(bad), "ports.invalid_concurrency");
+        let bad = Settings {
+            port_preset: PortChoice::Custom,
+            port_custom: "80-22".into(),
+            ..Settings::default()
+        };
+        assert_eq!(code(bad), "ports.reversed_range");
+        // A broken custom list is fine while another preset is selected ...
+        let kept = Settings {
+            port_custom: "80-22".into(),
+            ..Settings::default()
+        };
+        assert!(kept.validate().is_ok());
+        // ... but not if it is too long to be stored.
+        let long = Settings {
+            port_custom: "1".repeat(MAX_SPEC_LEN + 1),
+            ..Settings::default()
+        };
+        assert_eq!(code(long), "ports.input_too_long");
 
         for good in ["0.1.2", "1.0.0-beta.1", "2.0.0+build.7"] {
             let settings = Settings {

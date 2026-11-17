@@ -17,6 +17,7 @@ fn main() {
         "import_scan",
         "forget_known_devices",
         "scan_host_ports",
+        "check_port_list",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("failed to run tauri-build");

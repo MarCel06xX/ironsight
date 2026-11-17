@@ -22,6 +22,7 @@
   --accent-fg: #ffffff;
   --danger: #ff6b6b;
   --online: #3ecf8e;
+  --online-text: #3ecf8e; /* "open" state text, readable at 12 px */
   --offline: #5d6470;
   --shadow: rgb(0 0 0 / 45%);
   color-scheme: dark;
@@ -41,6 +42,7 @@
   --accent-fg: #ffffff;
   --danger: #c62828;
   --online: #1f9d55;
+  --online-text: #15803d; /* "open" state text, readable at 12 px */
   --offline: #a0a7b3;
   --shadow: rgb(15 23 42 / 18%);
   color-scheme: light;
@@ -60,6 +62,7 @@
   --accent-fg: #04122b;
   --danger: #ff7a7a;
   --online: #4ade80;
+  --online-text: #4ade80; /* "open" state text, readable at 12 px */
   --offline: #4f6385;
   --shadow: rgb(0 0 0 / 50%);
   color-scheme: dark;
@@ -79,6 +82,7 @@
   --accent-fg: #021002;
   --danger: #ff5555;
   --online: #39ff14;
+  --online-text: #39ff14; /* "open" state text, readable at 12 px */
   --offline: #2f5f2f;
   --shadow: rgb(0 0 0 / 60%);
   color-scheme: dark;
@@ -98,6 +102,7 @@
   --accent-fg: #ffffff;
   --danger: #ff6b8b;
   --online: #5eead4;
+  --online-text: #5eead4; /* "open" state text, readable at 12 px */
   --offline: #64597a;
   --shadow: rgb(0 0 0 / 50%);
   color-scheme: dark;
@@ -480,12 +485,70 @@ small.block {
   overflow-wrap: anywhere;
 }
 
-.service + .service {
-  margin-top: 6px;
+.details h3 {
+  margin: 16px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
-.service-name {
+/* Port table in the details panel. */
+.port-table {
+  width: 100%;
+  margin-top: 6px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+}
+
+.port-table th,
+.port-table td {
+  padding: 3px 6px 3px 0;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.port-table th {
   font-weight: 600;
+  color: var(--fg-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.port-table td {
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.port-table .col-port {
+  width: 44px;
+}
+
+.port-table .col-service {
+  width: 76px;
+}
+
+.port-table .col-state {
+  width: 64px;
+}
+
+.port-table td.port {
+  font-variant-numeric: tabular-nums;
+}
+
+.state-open {
+  font-weight: 600;
+  color: var(--online-text);
+}
+
+.state-closed {
+  color: var(--fg-muted);
+}
+
+.state-filtered {
+  font-style: italic;
+  color: var(--fg-muted);
 }
 
 .note {
@@ -603,6 +666,21 @@ fieldset.field legend {
 
 dialog .error {
   padding: 0 0 12px;
+}
+
+/* Inline check result of a port list field. */
+.field-message {
+  min-height: 1.4em;
+  font-size: 12px;
+}
+
+.field-message[data-kind="error"] {
+  color: var(--danger);
+}
+
+.notice-text {
+  margin: 0 0 16px;
+  line-height: 1.5;
 }
 
 .update-row {

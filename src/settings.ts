@@ -8,6 +8,7 @@ import {
   saveSettings,
 } from "./api";
 import { type MessageKey, t } from "./i18n";
+import { PortChoiceInput } from "./ports";
 import { THEMES, applyTheme } from "./theme";
 
 const LANGUAGES: readonly { id: LanguageSetting; label: MessageKey }[] = [
@@ -24,6 +25,9 @@ const OFFLINE_NAMES: readonly { id: OfflineNames; label: MessageKey }[] = [
 
 const CONCURRENCY = { min: 1, max: 256 };
 const TIMEOUT_MS = { min: 100, max: 10_000 };
+const PORT_TIMEOUT_MS = { min: 100, max: 10_000 };
+const PORT_CONCURRENCY = { min: 1, max: 1024 };
+const PORT_MAX_PROBES = { min: 1, max: 16_777_216 };
 
 function query<T extends Element>(root: ParentNode, selector: string): T {
   const el = root.querySelector<T>(selector);
@@ -68,6 +72,12 @@ export class SettingsDialog {
   private readonly checkNowButton: HTMLButtonElement;
   private readonly updateStatus: HTMLElement;
   private readonly error: HTMLElement;
+  private readonly portScan: HTMLInputElement;
+  private readonly ports: PortChoiceInput;
+  private readonly portTimeout: HTMLInputElement;
+  private readonly portConcurrency: HTMLInputElement;
+  private readonly portMaxProbes: HTMLInputElement;
+  private readonly banners: HTMLInputElement;
 
   constructor(
     private readonly dialog: HTMLDialogElement,
@@ -90,6 +100,18 @@ export class SettingsDialog {
     this.checkNowButton.addEventListener("click", () => void this.runCheck());
     this.offlineNames = query(dialog, "#set-offline-names");
     this.rememberDevices = query(dialog, "#set-remember");
+    this.portScan = query(dialog, "#set-port-scan");
+    this.ports = new PortChoiceInput(
+      query(dialog, "#set-port-preset"),
+      query(dialog, "#set-port-custom-field"),
+      query(dialog, "#set-port-custom"),
+      query(dialog, "#set-port-custom-msg"),
+      describeError,
+    );
+    this.portTimeout = query(dialog, "#set-port-timeout");
+    this.portConcurrency = query(dialog, "#set-port-concurrency");
+    this.portMaxProbes = query(dialog, "#set-port-max-probes");
+    this.banners = query(dialog, "#set-banners");
     const forget = query<HTMLButtonElement>(dialog, "#set-forget");
     forget.addEventListener("click", () => {
       forget.disabled = true;
@@ -122,14 +144,27 @@ export class SettingsDialog {
     this.checkUpdates.checked = current.checkUpdates;
     fillSelect(this.offlineNames, OFFLINE_NAMES, current.offlineNames);
     this.rememberDevices.checked = current.rememberDevices;
+    this.portScan.checked = current.portScan;
+    this.ports.set(current.portPreset, current.portCustom);
+    this.portTimeout.value = String(current.portTimeoutMs);
+    this.portConcurrency.value = String(current.portConcurrency);
+    this.portMaxProbes.value = String(current.portMaxProbes);
+    this.banners.checked = current.banners;
     query(this.dialog, "#set-version").textContent = t(
       this.info.portable ? "settings.versionPortable" : "settings.version",
       { version: this.info.version },
     );
     this.updateStatus.textContent = "";
     this.checkNowButton.disabled = false;
-    this.concurrency.removeAttribute("aria-invalid");
-    this.timeout.removeAttribute("aria-invalid");
+    for (const input of [
+      this.concurrency,
+      this.timeout,
+      this.portTimeout,
+      this.portConcurrency,
+      this.portMaxProbes,
+    ]) {
+      input.removeAttribute("aria-invalid");
+    }
     this.error.hidden = true;
     this.dialog.showModal();
   }
@@ -159,7 +194,18 @@ export class SettingsDialog {
   private async save(): Promise<void> {
     const concurrency = readInteger(this.concurrency, CONCURRENCY);
     const timeoutMs = readInteger(this.timeout, TIMEOUT_MS);
-    if (concurrency === null || timeoutMs === null) {
+    const portTimeoutMs = readInteger(this.portTimeout, PORT_TIMEOUT_MS);
+    const portConcurrency = readInteger(this.portConcurrency, PORT_CONCURRENCY);
+    const portMaxProbes = readInteger(this.portMaxProbes, PORT_MAX_PROBES);
+    const ports = await this.ports.read();
+    if (
+      concurrency === null ||
+      timeoutMs === null ||
+      portTimeoutMs === null ||
+      portConcurrency === null ||
+      portMaxProbes === null ||
+      ports === null
+    ) {
       this.showError(t("settings.invalid"));
       return;
     }
@@ -173,6 +219,13 @@ export class SettingsDialog {
       checkUpdates: this.checkUpdates.checked,
       offlineNames: this.offlineNames.value as OfflineNames,
       rememberDevices: this.rememberDevices.checked,
+      portScan: this.portScan.checked,
+      portPreset: ports.choice,
+      portCustom: ports.custom,
+      portTimeoutMs,
+      portConcurrency,
+      portMaxProbes,
+      banners: this.banners.checked,
     };
     try {
       await saveSettings(next);

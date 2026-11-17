@@ -13,10 +13,10 @@ the updater was tested end to end (0.1.2 -> 0.1.3). Releases only after the user
 commit + push after each phase, then stop and wait for the user's go.
 - Phase 1 (backend engine) **done**: `ports/` module, see "Port scanning" below.
 - Phase 2 (banners + pipeline) **done**: port step after discovery, `scan_host_ports`,
-  `ports:*` events, merged discovery check. Backend + `api.ts` types only, no UI yet.
-- Next: phase 3 UI (settings incl. persisted port options, column, detail table, context menu,
-  progress, one-time authorization notice, DE/EN, 5 themes), phase 4 export/import
-  (`schema_version` 3, fixtures for 1 and 2), phase 5 README/CHANGELOG/version bump (do NOT run
+  `ports:*` events, merged discovery check.
+- Phase 3 (UI) **done**: see "Port scan UI" below.
+- Next: phase 4 export/import (`schema_version` 3, fixtures for 1 and 2; CSV/JSON/HTML get port
+  state, service, banner), phase 5 README/CHANGELOG/version bump (do NOT run
   `scripts/release.ps1`).
 
 Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), packet
@@ -270,6 +270,38 @@ engine; the Tauri glue is in `commands.rs`.
   error }` (`error` e.g. `ports.too_many_probes` when online hosts x ports exceed the cap).
 - Live check (Win 11, own /24): 14 online, 53 discovery answers taken over, Top 100 port step
   1347 probes in 5.1 s in 11 batches; stop after 1.5 s ended at 1.51 s.
+
+## Port scan UI (phase 3)
+
+- Settings (`settings.rs` + `settings.ts`): `portScan` (off), `portPreset` (`PortChoice`
+  common|top100|top1000|all|custom), `portCustom` (kept while another preset is chosen; must
+  parse only when `custom` is selected, max 2048 bytes), `portTimeoutMs` (1000),
+  `portConcurrency` (256), `portMaxProbes` (1,000,000), `banners` (on), `portNoticeAccepted`.
+  Load resets bad values per field (invalid custom list -> preset `common`, text kept). Per-host
+  limit is not a setting (32).
+- Custom lists are checked by the Rust parser via `check_port_list(spec)` -> `{ normalized,
+  count }` (debounced 250 ms, `PortListField` in `ports.ts`), so UI and scan rules are identical;
+  the error shows inline (`.field-message`), the normalized list is what gets saved/sent.
+- `ports.ts`: `PortChoiceInput` (select + custom field), `HostPortsDialog` ("Scan ports …":
+  settings' list preselected or another one for this scan), `NoticeDialog` (one-time
+  authorization notice before the first port scan - network scan with `portScan` on, or "Scan
+  ports …"; Cancel aborts and asks again next time, accept is saved), `portOptions()`.
+- Table: column "Open ports" (`SortKey` `ports`, replaced the old services column; `col.services`
+  stays for exports): first 4 port numbers + "+N", "0" after a port scan without open ports,
+  "…" while the host's port scan runs; sort by count, scanned-with-0 before not scanned (nulls
+  last both ways). Filter: `port:N` terms (AND, any case) + remaining text (whitespace
+  collapsed); an invalid `port:` term matches nothing. Banners are part of the search text.
+- Details: "Ports" section after the `dl`: notes (selection, `probed of total – open/closed/
+  filtered`, stopped, local errors, or "quick check of 9 ports" without a port scan), table
+  Port/Service/State/Banner (banner, else `HTTP status · server · title`), "N closed/filtered/
+  open ports not listed". `ListedPort` carries the service `name`.
+- Progress (`main.ts`): `progress.mode` network|hostPorts, `progress.ports` {done,total} from
+  `ports:batch`; network mode switches the bar to checks during the port step and appends
+  "port scan: N open ports" at the end; `portsStopped` makes the final status "Stopped". Stop
+  button = `stop_scan` for both. "Scan ports …" keeps the table and shows its own progress.
+- Themes: new text colors only via variables; `--online-text` per theme for the "open" state
+  (light theme needs `#15803d`: `--online` is 3.5:1 on white). Checked: all five themes reach
+  WCAG AA (>= 4.5:1) for the new texts on `--bg-raised`/`--bg-input`.
 
 ## Commands
 

@@ -1,5 +1,15 @@
 // Display helpers shared by the table, the details panel, sorting and filtering.
-import type { DataSource, HostResult, HostStatus, NameSource } from "./api";
+import type {
+  DataSource,
+  HostResult,
+  HostStatus,
+  HttpInfo,
+  NameSource,
+  PortChoice,
+  PortSelection,
+  PortState,
+  ServiceInfo,
+} from "./api";
 import { type MessageKey, formatNumber, t } from "./i18n";
 
 const SOURCE_KEYS: Record<NameSource, MessageKey> = {
@@ -54,8 +64,70 @@ export function rttText(host: HostResult): string {
   return host.rttMs === 0 ? t("rtt.subMs") : t("rtt.ms", { ms: formatNumber(host.rttMs) });
 }
 
-export function servicesText(host: HostResult): string {
-  return host.services.map((service) => `${service.port} ${service.name}`).join(", ");
+/** Open ports shown in the table before "+N". */
+const SHORT_PORT_LIST = 4;
+/** Custom port lists are cut to this length in labels. */
+const MAX_LIST_LABEL = 40;
+
+/**
+ * Open ports for the table: "22, 80, 443, 445 +3"; "0" after a port scan that found none;
+ * "" if nothing is known. `…` marks a port scan of the host that is still running.
+ */
+export function openPortsText(host: HostResult, scanning: boolean): string {
+  const ports = host.services.map((service) => String(service.port));
+  let text = "";
+  if (ports.length > 0) {
+    const more = ports.length - SHORT_PORT_LIST;
+    const shown = ports.slice(0, SHORT_PORT_LIST).join(", ");
+    text = more > 0 ? `${shown} +${formatNumber(more)}` : shown;
+  } else if (host.portScan) {
+    text = formatNumber(0);
+  }
+  if (scanning && host.portScan && !host.portScan.complete) {
+    text = text === "" ? "…" : `${text} …`;
+  }
+  return text;
+}
+
+/** "HTTP 200 · nginx · Router Login" */
+export function httpText(http: HttpInfo): string {
+  const parts = [http.status === null ? null : `HTTP ${http.status}`, http.server, http.title];
+  return parts.filter((part): part is string => part !== null && part !== "").join(" · ");
+}
+
+/** What a service said about itself: its banner, otherwise its HTTP details. */
+export function bannerText(service: ServiceInfo): string {
+  if (service.banner !== null) return service.banner;
+  return service.http ? httpText(service.http) : "";
+}
+
+const PORT_CHOICE_KEYS: Record<PortChoice, MessageKey> = {
+  common: "ports.preset.common",
+  top100: "ports.preset.top100",
+  top1000: "ports.preset.top1000",
+  all: "ports.preset.all",
+  custom: "ports.preset.custom",
+};
+
+export function portChoiceLabel(choice: PortChoice): string {
+  return t(PORT_CHOICE_KEYS[choice]);
+}
+
+export function selectionLabel(selection: PortSelection): string {
+  if ("preset" in selection) return portChoiceLabel(selection.preset);
+  const list = selection.custom;
+  const short = list.length > MAX_LIST_LABEL ? `${list.slice(0, MAX_LIST_LABEL)}…` : list;
+  return t("ports.customLabel", { list: short });
+}
+
+const PORT_STATE_KEYS: Record<PortState, MessageKey> = {
+  open: "ports.state.open",
+  closed: "ports.state.closed",
+  filtered: "ports.state.filtered",
+};
+
+export function portStateLabel(state: PortState): string {
+  return t(PORT_STATE_KEYS[state]);
 }
 
 /** First page title, otherwise the first `Server` header. */

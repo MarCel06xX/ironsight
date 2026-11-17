@@ -59,6 +59,7 @@ pub fn run() {
             commands::import_scan,
             commands::forget_known_devices,
             commands::scan_host_ports,
+            commands::check_port_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

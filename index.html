@@ -184,6 +184,51 @@
           </div>
         </fieldset>
         <fieldset class="field">
+          <legend data-i18n="settings.portScan"></legend>
+          <label class="checkbox">
+            <input id="set-port-scan" type="checkbox" />
+            <span data-i18n="settings.portScanEnable"></span>
+          </label>
+          <small class="muted block" data-i18n="settings.portNotice"></small>
+          <label class="field">
+            <span data-i18n="settings.portPreset"></span>
+            <select id="set-port-preset"></select>
+          </label>
+          <div id="set-port-custom-field" class="field" hidden>
+            <label for="set-port-custom" data-i18n="settings.portCustom"></label>
+            <input
+              id="set-port-custom"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              maxlength="2048"
+              aria-describedby="set-port-custom-msg"
+              data-i18n-placeholder="settings.portCustomPlaceholder"
+            />
+            <small id="set-port-custom-msg" class="field-message" aria-live="polite"></small>
+          </div>
+          <label class="field">
+            <span data-i18n="settings.portTimeout"></span>
+            <input id="set-port-timeout" type="number" min="100" max="10000" step="1" required />
+            <small data-i18n="settings.portTimeoutHint"></small>
+          </label>
+          <label class="field">
+            <span data-i18n="settings.portConcurrency"></span>
+            <input id="set-port-concurrency" type="number" min="1" max="1024" step="1" required />
+            <small data-i18n="settings.portConcurrencyHint"></small>
+          </label>
+          <label class="field">
+            <span data-i18n="settings.portMaxProbes"></span>
+            <input id="set-port-max-probes" type="number" min="1" max="16777216" step="1" required />
+            <small data-i18n="settings.portMaxProbesHint"></small>
+          </label>
+          <label class="checkbox">
+            <input id="set-banners" type="checkbox" />
+            <span data-i18n="settings.banners"></span>
+          </label>
+          <small class="muted block" data-i18n="settings.bannersHint"></small>
+        </fieldset>
+        <fieldset class="field">
           <legend data-i18n="settings.updates"></legend>
           <label class="checkbox">
             <input id="set-check-updates" type="checkbox" />
@@ -201,6 +246,42 @@
           <button type="submit" class="primary" data-i18n="settings.save"></button>
         </div>
       </form>
+    </dialog>
+    <dialog id="host-ports-dialog" aria-labelledby="host-ports-title">
+      <form id="host-ports-form" method="dialog" novalidate>
+        <h2 id="host-ports-title"></h2>
+        <label class="field">
+          <span data-i18n="hostPorts.ports"></span>
+          <select id="host-ports-choice"></select>
+        </label>
+        <div id="host-ports-custom-field" class="field" hidden>
+          <label for="host-ports-custom" data-i18n="settings.portCustom"></label>
+          <input
+            id="host-ports-custom"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            maxlength="2048"
+            aria-describedby="host-ports-custom-msg"
+            data-i18n-placeholder="settings.portCustomPlaceholder"
+          />
+          <small id="host-ports-custom-msg" class="field-message" aria-live="polite"></small>
+        </div>
+        <small class="muted block" data-i18n="hostPorts.hint"></small>
+        <div class="dialog-actions">
+          <button id="host-ports-cancel" type="button" data-i18n="hostPorts.cancel"></button>
+          <button type="submit" class="primary" data-i18n="hostPorts.start"></button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="notice-dialog" aria-labelledby="notice-title" aria-describedby="notice-text">
+      <h2 id="notice-title" data-i18n="notice.title"></h2>
+      <p id="notice-text" class="notice-text" data-i18n="notice.text"></p>
+      <div class="dialog-actions">
+        <button id="notice-cancel" type="button" data-i18n="notice.cancel"></button>
+        <button id="notice-accept" type="button" class="primary" data-i18n="notice.accept"></button>
+      </div>
     </dialog>
   </body>
 </html>

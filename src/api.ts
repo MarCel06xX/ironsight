@@ -52,6 +52,8 @@ export interface ServiceInfo {
 
 export type PortState = "open" | "closed" | "filtered";
 export type PortPreset = "common" | "top100" | "top1000" | "all";
+/** Port list choice in the settings: a preset or the custom list. */
+export type PortChoice = PortPreset | "custom";
 /** Which ports a port scan covers. */
 export type PortSelection = { preset: PortPreset } | { custom: string };
 
@@ -68,7 +70,7 @@ export interface PortScanInfo {
   /** Probes that failed locally (no statement about the port). */
   errors: number;
   /** Closed and filtered ports one by one, while there are only a few of a state. */
-  listed: { port: number; state: PortState }[];
+  listed: { port: number; state: PortState; name: string }[];
 }
 
 /**
@@ -209,6 +211,25 @@ export interface Settings {
   offlineNames: OfflineNames;
   /** Save known devices to disk (opt-in). */
   rememberDevices: boolean;
+  /** Port scan of the hosts that answered, after host discovery (opt-in). */
+  portScan: boolean;
+  portPreset: PortChoice;
+  /** Custom port list, used with `portPreset: "custom"`. */
+  portCustom: string;
+  portTimeoutMs: number;
+  portConcurrency: number;
+  /** Port scans with more checks (hosts × ports) are refused. */
+  portMaxProbes: number;
+  /** Read banners and HTTP titles of open ports. */
+  banners: boolean;
+  /** The one-time "only scan networks you may scan" notice was acknowledged. */
+  portNoticeAccepted: boolean;
+}
+
+/** A custom port list as the backend parser understood it. */
+export interface PortListInfo {
+  normalized: string;
+  count: number;
 }
 
 /** Result of loading a previous scan or forgetting known devices. */
@@ -289,6 +310,10 @@ export const onScanBatch = (handler: (batch: ScanBatch) => void): Promise<Unlist
 
 export const onScanFinished = (handler: (summary: ScanSummary) => void): Promise<UnlistenFn> =>
   listen<ScanSummary>("scan:finished", (event) => handler(event.payload));
+
+/** Checks a custom port list with the backend's parser (same rules as the scan). */
+export const checkPortList = (spec: string): Promise<PortListInfo> =>
+  invoke("check_port_list", { spec });
 
 /** "Scan ports…" for one host of the last scan; results arrive as `ports:*` events. */
 export const scanHostPorts = (request: HostPortsRequest): Promise<PortScanStarted> =>

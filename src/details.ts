@@ -1,8 +1,17 @@
 // Details panel for the selected host. Built with DOM APIs only: most values are
 // untrusted network data.
-import type { DataSource, HostResult, NameSource, ServiceInfo } from "./api";
-import { originLabel, rttText, sourceLabel, statusClass, statusKey } from "./format";
-import { type MessageKey, formatDateTime, formatRelative, t } from "./i18n";
+import type { DataSource, HostResult, NameSource, PortState } from "./api";
+import {
+  bannerText,
+  originLabel,
+  portStateLabel,
+  rttText,
+  selectionLabel,
+  sourceLabel,
+  statusClass,
+  statusKey,
+} from "./format";
+import { type MessageKey, formatDateTime, formatNumber, formatRelative, t } from "./i18n";
 
 const NAME_SOURCES: readonly NameSource[] = ["dns", "mdns", "netbios"];
 
@@ -31,17 +40,104 @@ function sourceNotes(source: DataSource | null): HTMLElement[] {
   return [el("div", t("details.fieldSource", { source: originLabel(source) }), "note")];
 }
 
-function serviceNode(service: ServiceInfo): HTMLElement {
-  const node = document.createElement("div");
-  node.className = "service";
-  node.append(el("div", `${service.port} ${service.name}`, "service-name"));
-  const http = service.http;
-  if (http) {
-    if (http.status !== null) node.append(el("div", t("details.httpStatus", { status: http.status })));
-    if (http.server !== null) node.append(el("div", t("details.server", { server: http.server })));
-    if (http.title !== null) node.append(el("div", t("details.pageTitle", { title: http.title })));
+interface PortRow {
+  port: number;
+  name: string;
+  state: PortState;
+  banner: string;
+}
+
+const PORT_COLUMNS: readonly [string, MessageKey][] = [
+  ["col-port", "ports.colPort"],
+  ["col-service", "ports.colService"],
+  ["col-state", "ports.colState"],
+  ["col-banner", "ports.colBanner"],
+];
+
+function portTable(rows: readonly PortRow[]): HTMLTableElement {
+  const table = document.createElement("table");
+  table.className = "port-table";
+  const columns = document.createElement("colgroup");
+  const head = document.createElement("tr");
+  for (const [className, label] of PORT_COLUMNS) {
+    const col = document.createElement("col");
+    col.className = className;
+    columns.append(col);
+    head.append(el("th", t(label)));
   }
-  return node;
+  const thead = document.createElement("thead");
+  thead.append(head);
+  const tbody = document.createElement("tbody");
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    const state = el("span", portStateLabel(row.state), `state-${row.state}`);
+    const stateCell = document.createElement("td");
+    stateCell.append(state);
+    tr.append(
+      el("td", String(row.port), "port"),
+      el("td", row.name === "unknown" ? "" : row.name),
+      stateCell,
+      el("td", row.banner),
+    );
+    tbody.append(tr);
+  }
+  table.append(columns, thead, tbody);
+  return table;
+}
+
+/** Open ports (with banners) plus the closed/filtered ports a port scan listed. */
+function portsSection(host: HostResult): HTMLElement[] {
+  const scan = host.portScan;
+  if (host.services.length === 0 && !scan && !host.online) return [];
+  const nodes: HTMLElement[] = [el("h3", t("details.ports"))];
+  const note = (text: string): void => {
+    nodes.push(el("div", text, "note"));
+  };
+  if (scan) {
+    note(t("details.portScan", { selection: selectionLabel(scan.selection) }));
+    note(
+      t("details.portScanCounts", {
+        probed: formatNumber(scan.probed),
+        total: formatNumber(scan.total),
+        open: formatNumber(scan.open),
+        closed: formatNumber(scan.closed),
+        filtered: formatNumber(scan.filtered),
+      }),
+    );
+    if (!scan.complete) note(t("details.portScanIncomplete"));
+    if (scan.errors > 0) note(t("details.portScanErrors", { errors: formatNumber(scan.errors) }));
+  } else if (host.services.length > 0) {
+    note(t("details.discoveryPorts"));
+  }
+
+  const rows: PortRow[] = [
+    ...host.services.map((service) => ({
+      port: service.port,
+      name: service.name,
+      state: "open" as const,
+      banner: bannerText(service),
+    })),
+    ...(scan?.listed ?? []).map((listed) => ({ ...listed, banner: "" })),
+  ].sort((a, b) => a.port - b.port);
+
+  if (rows.length > 0) {
+    nodes.push(portTable(rows));
+  } else {
+    nodes.push(el("p", t(scan ? "details.noOpenPorts" : "details.noServices"), "muted"));
+  }
+  if (scan) {
+    const shown = (state: PortState): number => rows.filter((row) => row.state === state).length;
+    const hidden: [number, MessageKey][] = [
+      [scan.open - shown("open"), "details.moreOpen"],
+      [scan.closed - shown("closed"), "details.closedNotListed"],
+      [scan.filtered - shown("filtered"), "details.filteredNotListed"],
+    ];
+    for (const [count, key] of hidden) {
+      if (count > 0) note(t(key, { count: formatNumber(count) }));
+    }
+  }
+  nodes.push(...sourceNotes(host.sources.services));
+  return nodes;
 }
 
 export function renderDetails(panel: HTMLElement, host: HostResult | undefined, isOwn: boolean): void {
@@ -95,11 +191,6 @@ export function renderDetails(panel: HTMLElement, host: HostResult | undefined, 
   if (host.seenBy.tcp) seenBy.push(t("seenBy.tcp"));
   if (seenBy.length > 0) add("details.seenBy", [seenBy.join(", ")]);
 
-  if (host.services.length > 0) {
-    add("details.services", [...host.services.map(serviceNode), ...sourceNotes(sources.services)]);
-  } else if (host.online) {
-    add("details.services", [t("details.noServices")]);
-  }
   if (host.timestampMs > 0) add("details.lastSeen", [formatDateTime(host.timestampMs)]);
-  panel.append(list);
+  panel.append(list, ...portsSection(host));
 }

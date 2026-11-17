@@ -23,6 +23,7 @@
     "allow-import-scan",
     "allow-forget-known-devices",
     "allow-scan-host-ports",
+    "allow-check-port-list",
     "updater:default",
     "process:allow-restart"
   ]
