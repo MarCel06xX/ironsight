@@ -1,5 +1,5 @@
-//! TCP connect probes on a small fixed port list, plus a minimal HTTP/1.0 client that reads
-//! the `Server` header and the page title. Responses are untrusted and size-limited.
+//! The TCP check of host discovery on a small fixed port list, plus a minimal HTTP/1.0 client
+//! that reads the `Server` header and the page title. Responses are untrusted and size-limited.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -10,22 +10,16 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
 use super::clean_text;
+use crate::ports::PortState;
+use crate::ports::banner::{self, Method};
+use crate::ports::names;
+use crate::ports::probe::{self, Connect};
 use crate::scan::HttpInfo;
 
-/// Ports checked on every host, with the service usually found there.
-pub const PROBE_PORTS: [(u16, &str); 9] = [
-    (21, "ftp"),
-    (22, "ssh"),
-    (23, "telnet"),
-    (80, "http"),
-    (443, "https"),
-    (445, "smb"),
-    (3389, "rdp"),
-    (8080, "http-alt"),
-    (8443, "https-alt"),
-];
-/// Plain-HTTP ports whose title is fetched (HTTPS would need a TLS implementation).
-const HTTP_PORTS: [u16; 2] = [80, 8080];
+/// Ports checked on every address during host discovery. An open one makes the host online
+/// (hosts that ignore ping and sit behind a router have no other sign of life); the answers
+/// are kept and taken over by a port scan of the same host (see `ports::scanner::PortTarget`).
+pub const DISCOVERY_PORTS: [u16; 9] = [21, 22, 23, 80, 443, 445, 3389, 8080, 8443];
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 3;
@@ -34,41 +28,48 @@ const MAX_TITLE_BYTES: usize = 1024;
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_SERVER_CHARS: usize = 100;
 
+/// Display name of the service usually found on `port`, `"unknown"` if there is none.
 pub fn service_name(port: u16) -> &'static str {
-    PROBE_PORTS
-        .iter()
-        .find(|(p, _)| *p == port)
-        .map_or("unknown", |(_, name)| name)
+    names::service_name(port).unwrap_or("unknown")
 }
 
-/// Ports of [`PROBE_PORTS`] that accept a TCP connection within `timeout`, ascending.
-pub async fn open_ports(ip: IpAddr, timeout: Duration) -> Vec<u16> {
-    let ports: Vec<u16> = PROBE_PORTS.iter().map(|(port, _)| *port).collect();
-    connectable(ip, &ports, timeout).await
+/// Answers of the [`DISCOVERY_PORTS`] within `timeout`, ascending: open, closed (reset) or
+/// filtered. Ports where the probe failed locally are left out.
+pub async fn probe_ports(ip: IpAddr, timeout: Duration) -> Vec<(u16, PortState)> {
+    check_ports(ip, &DISCOVERY_PORTS, timeout).await
 }
 
-async fn connectable(ip: IpAddr, ports: &[u16], timeout: Duration) -> Vec<u16> {
+async fn check_ports(ip: IpAddr, ports: &[u16], timeout: Duration) -> Vec<(u16, PortState)> {
     let mut probes = JoinSet::new();
     for &port in ports {
         probes.spawn(async move {
-            let connect = TcpStream::connect(SocketAddr::new(ip, port));
-            matches!(tokio::time::timeout(timeout, connect).await, Ok(Ok(_))).then_some(port)
+            // The stream of an open port is dropped at once (reset, no TIME_WAIT).
+            let state = match probe::connect(SocketAddr::new(ip, port), timeout).await {
+                Connect::Open(_) => PortState::Open,
+                Connect::Closed => PortState::Closed,
+                Connect::Filtered => PortState::Filtered,
+                Connect::Failed => return None,
+            };
+            Some((port, state))
         });
     }
-    let mut open = Vec::new();
+    let mut answers = Vec::new();
     while let Some(result) = probes.join_next().await {
-        if let Ok(Some(port)) = result {
-            open.push(port);
+        if let Ok(Some(answer)) = result {
+            answers.push(answer);
         }
     }
-    open.sort_unstable();
-    open
+    answers.sort_unstable_by_key(|&(port, _)| port);
+    answers
 }
 
-/// Fetches `Server` header and title for every plain-HTTP port in `open`.
+/// Fetches `Server` header and title for every HTTP port in `open` (see `banner::method`).
 pub async fn http_infos(ip: IpAddr, open: &[u16], timeout: Duration) -> Vec<(u16, HttpInfo)> {
     let mut fetches = JoinSet::new();
-    for &port in open.iter().filter(|port| HTTP_PORTS.contains(port)) {
+    for &port in open
+        .iter()
+        .filter(|&&port| banner::method(port) == Method::Http)
+    {
         fetches.spawn(async move { Some((port, http_info(ip, port, timeout).await?)) });
     }
     let mut infos = Vec::new();
@@ -81,7 +82,7 @@ pub async fn http_infos(ip: IpAddr, open: &[u16], timeout: Duration) -> Vec<(u16
 }
 
 /// `GET /` with up to [`MAX_REDIRECTS`] same-origin redirects, all within twice `timeout`.
-async fn http_info(ip: IpAddr, port: u16, timeout: Duration) -> Option<HttpInfo> {
+pub(crate) async fn http_info(ip: IpAddr, port: u16, timeout: Duration) -> Option<HttpInfo> {
     let deadline = Instant::now() + timeout * 2;
     let mut path = String::from("/");
     let mut info: Option<HttpInfo> = None;
@@ -577,6 +578,18 @@ mod tests {
         assert_eq!(service_name(445), "smb");
         assert_eq!(service_name(8443), "https-alt");
         assert_eq!(service_name(1234), "unknown");
+        for port in DISCOVERY_PORTS {
+            assert_ne!(service_name(port), "unknown", "{port}");
+        }
+    }
+
+    #[test]
+    fn http_ports_of_the_discovery_list() {
+        let http: Vec<u16> = DISCOVERY_PORTS
+            .into_iter()
+            .filter(|&p| banner::method(p) == Method::Http)
+            .collect();
+        assert_eq!(http, [80, 8080]);
     }
 
     /// Serves the given raw responses, one per accepted connection.
@@ -651,12 +664,17 @@ mod tests {
             let temp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             temp.local_addr().unwrap().port()
         };
-        let found = connectable(
+        let started = std::time::Instant::now();
+        let found = check_ports(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[open, closed],
             Duration::from_secs(2),
         )
         .await;
-        assert_eq!(found, [open]);
+        // A closed port answers at once (no Windows SYN retries, see `ports::probe`).
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let mut expected = vec![(open, PortState::Open), (closed, PortState::Closed)];
+        expected.sort_unstable_by_key(|&(port, _)| port);
+        assert_eq!(found, expected);
     }
 }

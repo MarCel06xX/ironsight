@@ -22,6 +22,7 @@
     "allow-open-release-page",
     "allow-import-scan",
     "allow-forget-known-devices",
+    "allow-scan-host-ports",
     "updater:default",
     "process:allow-restart"
   ]

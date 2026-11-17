@@ -267,6 +267,7 @@ pub fn apply_known(base: &HostResult, known: Option<(DataSource, &KnownDevice)>)
                     port: s.port,
                     name: services::service_name(s.port),
                     http: s.http.clone(),
+                    banner: None,
                 })
                 .collect();
             host.sources.services = Some(source);

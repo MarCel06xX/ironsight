@@ -46,6 +46,29 @@ export interface ServiceInfo {
   name: string;
   /** Filled for plain-HTTP ports that answered a `GET /`. */
   http: HttpInfo | null;
+  /** Cleaned greeting of the service (banner grabbing); untrusted, `textContent` only. */
+  banner: string | null;
+}
+
+export type PortState = "open" | "closed" | "filtered";
+export type PortPreset = "common" | "top100" | "top1000" | "all";
+/** Which ports a port scan covers. */
+export type PortSelection = { preset: PortPreset } | { custom: string };
+
+/** Port scan of one host; its open ports are in `HostResult.services`. */
+export interface PortScanInfo {
+  selection: PortSelection;
+  /** Every port has a result (`false` while running or after a stop). */
+  complete: boolean;
+  probed: number;
+  total: number;
+  open: number;
+  closed: number;
+  filtered: number;
+  /** Probes that failed locally (no statement about the port). */
+  errors: number;
+  /** Closed and filtered ports one by one, while there are only a few of a state. */
+  listed: { port: number; state: PortState }[];
 }
 
 /**
@@ -70,6 +93,8 @@ export interface HostResult {
   names: { dns: string | null; mdns: string | null; netbios: string | null };
   workgroup: string | null;
   services: ServiceInfo[];
+  /** Port scan of this host, if one ran. */
+  portScan: PortScanInfo | null;
   timestampMs: number;
   status: HostStatus;
   /** When the device was last seen online (now, or from the known devices). */
@@ -104,6 +129,59 @@ export interface ScanRequest {
   timeoutMs?: number;
   /** Reverse DNS for addresses that do not answer. */
   offlineNames?: OfflineNames;
+  /** Read banners and HTTP titles of open ports (default: on). */
+  banners?: boolean;
+  /** Port scan of the hosts that answered, after host discovery. */
+  ports?: PortScanOptions | null;
+}
+
+/** Port scan settings; missing limits use the backend defaults. */
+export interface PortScanOptions {
+  selection: PortSelection;
+  timeoutMs?: number;
+  concurrency?: number;
+  perHost?: number;
+  maxProbes?: number;
+}
+
+export interface HostPortsRequest {
+  ip: string;
+  ports: PortScanOptions;
+  banners?: boolean;
+}
+
+export interface PortScanStarted {
+  scanId: number;
+  /** Probes to make. */
+  total: number;
+}
+
+/** `ports:batch`: changed rows (upsert by `ip`) plus progress in probes. */
+export interface PortsBatch {
+  scanId: number;
+  hosts: HostResult[];
+  done: number;
+  total: number;
+}
+
+export interface PortScanSummary {
+  scanId: number;
+  cancelled: boolean;
+  hosts: number;
+  hostsComplete: number;
+  done: number;
+  total: number;
+  open: number;
+  errors: number;
+  startedAtMs: number;
+  finishedAtMs: number;
+}
+
+/** `ports:finished`: `error` if the port scan was refused (e.g. above the probe limit). */
+export interface PortsFinished {
+  scanId: number;
+  summary: PortScanSummary | null;
+  error: CommandError | null;
 }
 
 export interface ScanStarted {
@@ -211,3 +289,13 @@ export const onScanBatch = (handler: (batch: ScanBatch) => void): Promise<Unlist
 
 export const onScanFinished = (handler: (summary: ScanSummary) => void): Promise<UnlistenFn> =>
   listen<ScanSummary>("scan:finished", (event) => handler(event.payload));
+
+/** "Scan ports…" for one host of the last scan; results arrive as `ports:*` events. */
+export const scanHostPorts = (request: HostPortsRequest): Promise<PortScanStarted> =>
+  invoke("scan_host_ports", { request });
+
+export const onPortsBatch = (handler: (batch: PortsBatch) => void): Promise<UnlistenFn> =>
+  listen<PortsBatch>("ports:batch", (event) => handler(event.payload));
+
+export const onPortsFinished = (handler: (finished: PortsFinished) => void): Promise<UnlistenFn> =>
+  listen<PortsFinished>("ports:finished", (event) => handler(event.payload));

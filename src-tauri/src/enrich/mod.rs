@@ -7,8 +7,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
 
 use crate::platform::{Adapter, Ipv4Net};
+use crate::ports::PortState;
+use crate::ports::banner::{self, Method};
 use crate::scan::engine::HostProbes;
 use crate::scan::{HostNames, HostResult};
 
@@ -34,10 +37,12 @@ struct Link {
 /// The real [`HostProbes`] implementation used by the app.
 pub struct NetEnricher {
     links: Vec<Link>,
+    /// Read banners and HTTP titles of open ports.
+    banners: bool,
 }
 
 impl NetEnricher {
-    pub fn new(adapters: &[Adapter]) -> Self {
+    pub fn new(adapters: &[Adapter], banners: bool) -> Self {
         let links = adapters
             .iter()
             .flat_map(|adapter| {
@@ -47,7 +52,7 @@ impl NetEnricher {
                 })
             })
             .collect();
-        Self { links }
+        Self { links, banners }
     }
 
     fn is_on_link(&self, ip: Ipv4Addr) -> bool {
@@ -73,8 +78,8 @@ impl NetEnricher {
 }
 
 impl HostProbes for NetEnricher {
-    async fn open_ports(&self, ip: IpAddr, timeout: Duration) -> Vec<u16> {
-        services::open_ports(ip, timeout).await
+    async fn tcp_ports(&self, ip: IpAddr, timeout: Duration) -> Vec<(u16, PortState)> {
+        services::probe_ports(ip, timeout).await
     }
 
     async fn reverse_dns(&self, ip: IpAddr, timeout: Duration) -> Option<String> {
@@ -98,7 +103,16 @@ impl HostProbes for NetEnricher {
         let use_mdns = v4.is_some_and(|v4| self.is_on_link(v4));
         let open_ports: Vec<u16> = host.services.iter().map(|s| s.port).collect();
 
-        let (dns_name, node_status, mdns_name, http) = tokio::join!(
+        let details = async {
+            match self.banners {
+                true => tokio::join!(
+                    services::http_infos(ip, &open_ports, timeout),
+                    passive_banners(ip, &open_ports, timeout),
+                ),
+                false => (Vec::new(), Vec::new()),
+            }
+        };
+        let (dns_name, node_status, mdns_name, (http, banners)) = tokio::join!(
             dns::reverse_lookup(ip, &dns_servers, timeout),
             netbios::node_status(ip, timeout),
             async {
@@ -107,7 +121,7 @@ impl HostProbes for NetEnricher {
                     false => None,
                 }
             },
-            services::http_infos(ip, &open_ports, timeout),
+            details,
         );
 
         let node_status = node_status.unwrap_or_default();
@@ -126,9 +140,34 @@ impl HostProbes for NetEnricher {
                 service.http = Some(info);
             }
         }
+        for (port, text) in banners {
+            if let Some(service) = host.services.iter_mut().find(|s| s.port == port) {
+                service.banner = Some(text);
+            }
+        }
         host.pick_hostname();
         host
     }
+}
+
+/// Greetings of the open ports whose services talk first (see `ports::banner`). The
+/// discovery check closed its connections at once, so this connects again.
+async fn passive_banners(ip: IpAddr, open: &[u16], timeout: Duration) -> Vec<(u16, String)> {
+    let mut grabs = JoinSet::new();
+    for &port in open
+        .iter()
+        .filter(|&&port| banner::method(port) == Method::Passive)
+    {
+        grabs
+            .spawn(async move { Some((port, banner::grab_open(ip, port, timeout).await.banner?)) });
+    }
+    let mut banners = Vec::new();
+    while let Some(result) = grabs.join_next().await {
+        if let Ok(Some(found)) = result {
+            banners.push(found);
+        }
+    }
+    banners
 }
 
 /// Sends one datagram from a fresh ephemeral port and returns the first reply from `peer`.
@@ -244,10 +283,13 @@ mod tests {
 
     #[test]
     fn dns_servers_of_the_hosts_adapter_come_first() {
-        let enricher = NetEnricher::new(&[
-            adapter([10, 8, 0, 2], 24, &[[10, 8, 0, 1], [1, 1, 1, 1]]),
-            adapter([192, 168, 178, 20], 24, &[[192, 168, 178, 1], [1, 1, 1, 1]]),
-        ]);
+        let enricher = NetEnricher::new(
+            &[
+                adapter([10, 8, 0, 2], 24, &[[10, 8, 0, 1], [1, 1, 1, 1]]),
+                adapter([192, 168, 178, 20], 24, &[[192, 168, 178, 1], [1, 1, 1, 1]]),
+            ],
+            true,
+        );
         let lan_host = Ipv4Addr::new(192, 168, 178, 50);
         assert_eq!(
             enricher.dns_servers_for(Some(lan_host)),

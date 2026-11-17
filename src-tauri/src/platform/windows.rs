@@ -624,7 +624,7 @@ mod live {
         let started = std::time::Instant::now();
         let summary = run_scan(
             Arc::new(WindowsBackend),
-            Arc::new(NetEnricher::new(&adapters)),
+            Arc::new(NetEnricher::new(&adapters, true)),
             TargetSet::parse(&target).unwrap(),
             ScanConfig {
                 concurrency: 64,
@@ -666,5 +666,136 @@ mod live {
         );
         assert_eq!(summary.scanned, summary.total);
         assert!(summary.online >= 1, "this machine itself must be online");
+    }
+
+    /// Host discovery of the local /24 followed by a "Top 100" port scan with banners, as
+    /// the app runs it: `cargo test live_scan_with_ports -- --ignored --nocapture`.
+    /// `IRONSIGHT_STOP_AFTER_MS=<ms>` stops the port step after that time.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "scans the local subnet of the first adapter with a gateway"]
+    async fn live_scan_with_ports() {
+        use std::collections::HashMap;
+
+        use crate::ports::PortSelection;
+        use crate::ports::presets::PortPreset;
+        use crate::ports::scanner::{PortScanConfig, TcpProber, scan_ports};
+        use crate::scan::HostResult;
+
+        let adapters = WindowsBackend.list_adapters().unwrap();
+        let Some(net) = adapters
+            .iter()
+            .find(|a| a.has_gateway)
+            .and_then(|a| a.ipv4.first())
+        else {
+            println!("no adapter with a gateway, nothing to scan");
+            return;
+        };
+        let [a, b, c, _] = net.addr.octets();
+        let target = format!("{a}.{b}.{c}.0/24");
+        let hosts = Arc::new(std::sync::Mutex::new(HashMap::<IpAddr, HostResult>::new()));
+        let sink = Arc::clone(&hosts);
+        let (_cancel, cancelled) = watch::channel(false);
+        let started = std::time::Instant::now();
+        run_scan(
+            Arc::new(WindowsBackend),
+            Arc::new(NetEnricher::new(&adapters, true)),
+            TargetSet::parse(&target).unwrap(),
+            ScanConfig {
+                concurrency: 64,
+                timeout: Duration::from_millis(1000),
+                resolve_offline_names: false,
+            },
+            cancelled,
+            1,
+            move |batch| {
+                let mut hosts = sink.lock().unwrap();
+                for host in batch.hosts {
+                    hosts.insert(host.ip, host);
+                }
+            },
+        )
+        .await;
+        let discovery = started.elapsed();
+        let mut online: Vec<HostResult> = hosts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|h| h.online)
+            .cloned()
+            .collect();
+        online.sort_by_key(|h| h.ip);
+        let taken_over: usize = online.iter().map(|h| h.port_target().known.len()).sum();
+        let discovery_banners: usize = online
+            .iter()
+            .flat_map(|h| &h.services)
+            .filter(|s| s.banner.is_some())
+            .count();
+
+        let (stop, cancelled) = watch::channel(false);
+        if let Some(ms) = std::env::var("IRONSIGHT_STOP_AFTER_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                stop.send_replace(true);
+            });
+        }
+        let set = PortPreset::Top100.ports();
+        let selection = PortSelection::Preset(PortPreset::Top100);
+        let reports = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let sink = Arc::clone(&reports);
+        let batches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&batches);
+        let port_started = std::time::Instant::now();
+        let summary = scan_ports(
+            Arc::new(TcpProber { banners: true }),
+            online.iter().map(HostResult::port_target).collect(),
+            Arc::new(set.clone()),
+            PortScanConfig::default(),
+            cancelled,
+            2,
+            move |batch| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut reports = sink.lock().unwrap();
+                for report in batch.hosts {
+                    reports.insert(report.ip, report);
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let reports = reports.lock().unwrap();
+        let (mut open, mut banners, mut titles, mut listed) = (0, 0, 0, 0);
+        for host in &mut online {
+            if let Some(report) = reports.get(&host.ip) {
+                host.apply_ports(&selection, &set, report);
+            }
+            open += host.services.len();
+            banners += host.services.iter().filter(|s| s.banner.is_some()).count();
+            titles += host.services.iter().filter(|s| s.http.is_some()).count();
+            listed += host.port_scan.as_ref().map_or(0, |p| p.listed.len());
+        }
+        println!(
+            "discovery: online={} in {discovery:?}, answers taken over={taken_over}, banners={discovery_banners}",
+            online.len()
+        );
+        println!(
+            "ports: done={}/{} cancelled={} hosts complete={}/{} errors={} batches={} in {:?}",
+            summary.done,
+            summary.total,
+            summary.cancelled,
+            summary.hosts_complete,
+            summary.hosts,
+            summary.errors,
+            batches.load(std::sync::atomic::Ordering::Relaxed),
+            port_started.elapsed()
+        );
+        println!(
+            "shown: open ports={open} banners={banners} http={titles} listed closed/filtered={listed}"
+        );
+        if !summary.cancelled {
+            assert_eq!(summary.done, summary.total);
+        }
     }
 }

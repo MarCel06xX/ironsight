@@ -15,6 +15,7 @@ use super::range::TargetSet;
 use super::{DataSource, HostResult, ScanBatch, ScanConfig, ScanSummary, SeenBy, ServiceInfo};
 use crate::mac::MacAddr;
 use crate::platform::{Ipv4Net, NetBackend, NetError};
+use crate::ports::PortState;
 
 /// Results are flushed to the frontend at this interval ...
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
@@ -30,8 +31,12 @@ const MAX_OFFLINE_DNS: usize = 32;
 
 /// Portable (socket-based) probing and enrichment, implemented by `enrich::NetEnricher`.
 pub trait HostProbes: Send + Sync + 'static {
-    /// Ports from the probe list that accept a TCP connection, ascending.
-    fn open_ports(&self, ip: IpAddr, timeout: Duration) -> impl Future<Output = Vec<u16>> + Send;
+    /// Answers of the discovery TCP check (open, closed or filtered per port), ascending.
+    fn tcp_ports(
+        &self,
+        ip: IpAddr,
+        timeout: Duration,
+    ) -> impl Future<Output = Vec<(u16, PortState)>> + Send;
 
     /// Adds names, vendor and service details to a host that was found online.
     fn enrich(
@@ -389,8 +394,15 @@ async fn discover<P: HostProbes>(
             None => Some(Ok(Ok(None))),
         }
     };
-    let tcp_task = shared.probes.open_ports(IpAddr::V4(ip), timeout);
-    let (icmp, arp, open_ports) = tokio::join!(icmp_task, arp_task, tcp_task);
+    let tcp_task = shared.probes.tcp_ports(IpAddr::V4(ip), timeout);
+    let (icmp, arp, tcp_answers) = tokio::join!(icmp_task, arp_task, tcp_task);
+    // Only an accepted connection counts as a sign of life: some firewalls answer with a
+    // reset for addresses that do not exist.
+    let open_ports: Vec<u16> = tcp_answers
+        .iter()
+        .filter(|&&(_, state)| state == PortState::Open)
+        .map(|&(port, _)| port)
+        .collect();
 
     let mut had_error = false;
     let rtt = match icmp {
@@ -418,6 +430,7 @@ async fn discover<P: HostProbes>(
     host.online = own.is_some() || host.seen_by.arp || host.seen_by.icmp || host.seen_by.tcp;
     host.rtt_ms = rtt.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
     host.services = open_ports.into_iter().map(ServiceInfo::open).collect();
+    host.probed_ports = tcp_answers;
     if let Some(mac) = own.and_then(|link| link.mac).or(arp_mac) {
         host.set_mac(mac);
     }
@@ -578,11 +591,14 @@ mod tests {
     }
 
     impl HostProbes for MockProbes {
-        async fn open_ports(&self, ip: IpAddr, _timeout: Duration) -> Vec<u16> {
-            match ip {
+        async fn tcp_ports(&self, ip: IpAddr, _timeout: Duration) -> Vec<(u16, PortState)> {
+            let open = match ip {
                 IpAddr::V4(v4) => self.open.get(&v4).cloned().unwrap_or_default(),
                 IpAddr::V6(_) => Vec::new(),
-            }
+            };
+            open.into_iter()
+                .map(|port| (port, PortState::Open))
+                .collect()
         }
 
         async fn enrich(&self, mut host: HostResult, _timeout: Duration) -> HostResult {
@@ -746,6 +762,11 @@ mod tests {
         assert!(found.online && found.seen_by.tcp && !found.seen_by.arp && !found.seen_by.icmp);
         let services: Vec<_> = found.services.iter().map(|s| (s.port, s.name)).collect();
         assert_eq!(services, [(80, "http"), (443, "https")]);
+        // The answers are kept for a port scan of the host.
+        assert_eq!(
+            found.probed_ports,
+            [(80, PortState::Open), (443, PortState::Open)]
+        );
         assert!(!host(&updates, ip(8)).online);
     }
 

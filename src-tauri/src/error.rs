@@ -3,6 +3,8 @@
 use serde::Serialize;
 
 use crate::platform::{LaunchError, NetError};
+use crate::ports::scanner::PortScanError;
+use crate::ports::spec::PortSpecError;
 use crate::scan::ConfigError;
 use crate::scan::range::RangeError;
 
@@ -32,6 +34,26 @@ impl CommandError {
 
 impl From<RangeError> for CommandError {
     fn from(e: RangeError) -> Self {
+        Self {
+            code: e.code(),
+            message: e.to_string(),
+            detail: e.detail(),
+        }
+    }
+}
+
+impl From<PortSpecError> for CommandError {
+    fn from(e: PortSpecError) -> Self {
+        Self {
+            code: e.code(),
+            message: e.to_string(),
+            detail: e.detail(),
+        }
+    }
+}
+
+impl From<PortScanError> for CommandError {
+    fn from(e: PortScanError) -> Self {
         Self {
             code: e.code(),
             message: e.to_string(),
@@ -83,6 +105,64 @@ mod tests {
         let e = CommandError::from(RangeError::TooManyHosts { count: 70_000 });
         assert_eq!(e.detail.as_deref(), Some("70000"));
         assert_eq!(CommandError::from(RangeError::Empty).detail, None);
+    }
+
+    #[test]
+    fn port_errors_carry_code_and_detail() {
+        let e = CommandError::from(PortSpecError::InvalidPort("ssh".into()));
+        assert_eq!(
+            (e.code, e.detail.as_deref()),
+            ("ports.invalid_port", Some("ssh"))
+        );
+        let e = CommandError::from(PortScanError::TooManyProbes {
+            hosts: 2,
+            ports: 3,
+            probes: 6,
+            max: 5,
+        });
+        assert_eq!(
+            (e.code, e.detail.as_deref()),
+            ("ports.too_many_probes", Some("6"))
+        );
+    }
+
+    #[test]
+    fn port_error_codes_have_messages_in_both_languages() {
+        let spec_errors = [
+            PortSpecError::Empty,
+            PortSpecError::InputTooLong,
+            PortSpecError::EmptyEntry,
+            PortSpecError::InvalidPort(String::new()),
+            PortSpecError::OutOfRange(String::new()),
+            PortSpecError::InvalidRange(String::new()),
+            PortSpecError::ReversedRange(String::new()),
+        ];
+        let scan_errors = [
+            PortScanError::Timeout,
+            PortScanError::Concurrency,
+            PortScanError::PerHost,
+            PortScanError::MaxProbes,
+            PortScanError::TooManyProbes {
+                hosts: 0,
+                ports: 0,
+                probes: 0,
+                max: 0,
+            },
+        ];
+        let codes = spec_errors
+            .iter()
+            .map(PortSpecError::code)
+            .chain(scan_errors.iter().map(PortScanError::code))
+            .chain(["ports.unknown_host"]);
+        let locales = [
+            include_str!("../../src/locales/en.json"),
+            include_str!("../../src/locales/de.json"),
+        ];
+        for code in codes {
+            for locale in locales {
+                assert!(locale.contains(&format!("\"error.{code}\"")), "{code}");
+            }
+        }
     }
 
     #[test]

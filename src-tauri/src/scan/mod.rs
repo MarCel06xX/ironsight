@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::enrich::{oui, services};
 use crate::mac::MacAddr;
+use crate::ports::scanner::{HostPorts, PortTarget, Probe};
+use crate::ports::spec::PortSet;
+use crate::ports::{PortSelection, PortState};
 
 pub mod engine;
 pub mod range;
@@ -118,7 +121,7 @@ pub struct HttpInfo {
     pub title: Option<String>,
 }
 
-/// An open TCP port from the probe list.
+/// An open TCP port (from the discovery check or a port scan).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceInfo {
@@ -126,6 +129,8 @@ pub struct ServiceInfo {
     pub name: &'static str,
     /// Filled for plain-HTTP ports that answered a `GET /`.
     pub http: Option<HttpInfo>,
+    /// Cleaned greeting of the service (banner grabbing), see `ports::banner`.
+    pub banner: Option<String>,
 }
 
 impl ServiceInfo {
@@ -134,8 +139,35 @@ impl ServiceInfo {
             port,
             name: services::service_name(port),
             http: None,
+            banner: None,
         }
     }
+}
+
+/// A closed or filtered port, listed when a host has only a few of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedPort {
+    pub port: u16,
+    pub state: PortState,
+}
+
+/// Port scan of one host. Open ports are in [`HostResult::services`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortScanInfo {
+    pub selection: PortSelection,
+    /// Every port of the selection has a result (`false` while running or after a stop).
+    pub complete: bool,
+    pub probed: u32,
+    pub total: u32,
+    pub open: u32,
+    pub closed: u32,
+    pub filtered: u32,
+    /// Probes that failed locally (no statement about the port).
+    pub errors: u32,
+    /// Closed and filtered ports one by one, while there are only a few of a state.
+    pub listed: Vec<ListedPort>,
 }
 
 /// What is known about an address right now.
@@ -202,6 +234,12 @@ pub struct HostResult {
     /// NetBIOS workgroup or domain.
     pub workgroup: Option<String>,
     pub services: Vec<ServiceInfo>,
+    /// Port scan of this host, if one ran.
+    pub port_scan: Option<PortScanInfo>,
+    /// Answers of the discovery TCP check (`services::DISCOVERY_PORTS`), taken over by a port
+    /// scan of this host. Internal, not sent to the frontend.
+    #[serde(skip)]
+    pub probed_ports: Vec<(u16, PortState)>,
     /// Unix time in milliseconds when the probe finished.
     pub timestamp_ms: u64,
     pub status: HostStatus,
@@ -227,6 +265,8 @@ impl HostResult {
             names: HostNames::default(),
             workgroup: None,
             services: Vec::new(),
+            port_scan: None,
+            probed_ports: Vec::new(),
             timestamp_ms: 0,
             status: HostStatus::Unused,
             last_seen_ms: None,
@@ -277,6 +317,87 @@ impl HostResult {
         };
     }
 
+    /// Port scan target: the discovery check's definite answers (open, closed) are taken
+    /// over; ports that stayed silent are probed again.
+    pub fn port_target(&self) -> PortTarget {
+        let known = self
+            .probed_ports
+            .iter()
+            .filter_map(|&(port, state)| match state {
+                PortState::Open => Some((port, Probe::OPEN)),
+                PortState::Closed => Some((port, Probe::Closed)),
+                PortState::Filtered => None,
+            })
+            .collect();
+        PortTarget { ip: self.ip, known }
+    }
+
+    /// Shows a port scan result: open ports join `services` with their banner/HTTP details,
+    /// `port_scan` gets the counts. A port the scan has fully covered replaces what was known
+    /// before (an open port from host discovery that is closed now disappears); while the scan
+    /// runs, or if it was stopped, earlier knowledge stays.
+    pub fn apply_ports(&mut self, selection: &PortSelection, set: &PortSet, report: &HostPorts) {
+        let open: Vec<_> = report
+            .ports
+            .iter()
+            .filter(|entry| entry.state == PortState::Open)
+            .collect();
+        // All open ports are listed unless there were too many.
+        let authoritative = report.complete && open.len() == report.open as usize;
+        let mut services: Vec<ServiceInfo> = std::mem::take(&mut self.services)
+            .into_iter()
+            .filter(|service| {
+                !authoritative
+                    || !set.contains(service.port)
+                    || open.iter().any(|entry| entry.port == service.port)
+            })
+            .collect();
+        for entry in open {
+            match services.iter_mut().find(|s| s.port == entry.port) {
+                Some(service) => {
+                    // New details win; the discovery's banner/title stay if the scan has none.
+                    if entry.banner.is_some() {
+                        service.banner.clone_from(&entry.banner);
+                    }
+                    if entry.http.is_some() {
+                        service.http.clone_from(&entry.http);
+                    }
+                }
+                None => services.push(ServiceInfo {
+                    port: entry.port,
+                    name: services::service_name(entry.port),
+                    http: entry.http.clone(),
+                    banner: entry.banner.clone(),
+                }),
+            }
+        }
+        services.sort_unstable_by_key(|service| service.port);
+        self.services = services;
+        if self.online {
+            self.sources.services = (!self.services.is_empty()).then_some(DataSource::Live);
+        }
+        self.port_scan = Some(PortScanInfo {
+            selection: selection.clone(),
+            complete: report.complete,
+            probed: report.probed,
+            total: report.total,
+            open: report.open,
+            closed: report.closed,
+            filtered: report.filtered,
+            errors: report.errors,
+            listed: report
+                .ports
+                .iter()
+                .filter(|entry| entry.state != PortState::Open)
+                .map(|entry| ListedPort {
+                    port: entry.port,
+                    state: entry.state,
+                })
+                .collect(),
+        });
+        self.update_status();
+    }
+
     /// Chooses the display name: DNS first (usually fully qualified), then mDNS, then the
     /// upper-cased, length-limited NetBIOS name.
     pub fn pick_hostname(&mut self) {
@@ -322,6 +443,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::ports::scanner::PortEntry;
 
     fn host() -> HostResult {
         HostResult::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)))
@@ -420,6 +542,142 @@ mod tests {
         assert_eq!(json["macLocal"], false);
         assert_eq!(json["services"][0]["name"], "http");
         assert!(json["services"][0]["http"].is_null());
+        assert!(json["services"][0]["banner"].is_null());
         assert!(json["rttMs"].is_null());
+        assert!(json["portScan"].is_null());
+        // Internal discovery answers are not sent.
+        assert!(json.get("probedPorts").is_none());
+    }
+
+    fn entry(port: u16, state: PortState, banner: Option<&str>) -> PortEntry {
+        PortEntry {
+            port,
+            state,
+            service: crate::ports::names::service_name(port),
+            banner: banner.map(str::to_owned),
+            http: None,
+        }
+    }
+
+    fn report(complete: bool, ports: Vec<PortEntry>) -> HostPorts {
+        let count = |state| ports.iter().filter(|e| e.state == state).count() as u32;
+        HostPorts {
+            ip: host().ip,
+            complete,
+            probed: ports.len() as u32,
+            total: 100,
+            open: count(PortState::Open),
+            closed: count(PortState::Closed),
+            filtered: count(PortState::Filtered),
+            errors: 0,
+            ports,
+        }
+    }
+
+    fn online_host_with_discovery_services() -> HostResult {
+        let mut h = host();
+        h.online = true;
+        let mut ssh = ServiceInfo::open(22);
+        ssh.banner = Some("SSH-2.0-OpenSSH_9.6".into());
+        let mut web = ServiceInfo::open(80);
+        web.http = Some(HttpInfo {
+            status: Some(200),
+            server: None,
+            title: Some("Router".into()),
+        });
+        // 445 is outside the scanned set below.
+        h.services = vec![ssh, web, ServiceInfo::open(445)];
+        h.mark_live();
+        h
+    }
+
+    #[test]
+    fn port_scan_adds_open_ports_and_keeps_discovery_details() {
+        let mut h = online_host_with_discovery_services();
+        let set = PortSet::parse("1-100,8000").unwrap();
+        let selection = PortSelection::Custom("1-100,8000".into());
+        h.apply_ports(
+            &selection,
+            &set,
+            &report(
+                true,
+                vec![
+                    entry(21, PortState::Open, Some("220 FTP ready")),
+                    entry(22, PortState::Open, None),
+                    entry(23, PortState::Closed, None),
+                    entry(80, PortState::Open, None),
+                    entry(8000, PortState::Filtered, None),
+                ],
+            ),
+        );
+        let ports: Vec<u16> = h.services.iter().map(|s| s.port).collect();
+        assert_eq!(ports, [21, 22, 80, 445]);
+        assert_eq!(h.services[0].banner.as_deref(), Some("220 FTP ready"));
+        assert_eq!(h.services[0].name, "ftp");
+        // Details found during discovery stay when the scan has none.
+        assert_eq!(h.services[1].banner.as_deref(), Some("SSH-2.0-OpenSSH_9.6"));
+        assert!(h.services[2].http.is_some());
+        let scan = h.port_scan.as_ref().unwrap();
+        assert_eq!(scan.selection, selection);
+        assert!(scan.complete);
+        assert_eq!((scan.open, scan.closed, scan.filtered), (3, 1, 1));
+        assert_eq!(
+            scan.listed,
+            [
+                ListedPort {
+                    port: 23,
+                    state: PortState::Closed
+                },
+                ListedPort {
+                    port: 8000,
+                    state: PortState::Filtered
+                },
+            ]
+        );
+        assert_eq!(h.sources.services, Some(DataSource::Live));
+        assert_eq!(h.status, HostStatus::Online);
+    }
+
+    #[test]
+    fn a_complete_scan_removes_ports_that_are_no_longer_open() {
+        let set = PortSet::parse("1-100").unwrap();
+        let selection = PortSelection::Custom("1-100".into());
+        let scanned = report(true, vec![entry(22, PortState::Open, None)]);
+
+        let mut h = online_host_with_discovery_services();
+        h.apply_ports(&selection, &set, &scanned);
+        // 80 was open during discovery but not now; 445 was not scanned.
+        let ports: Vec<u16> = h.services.iter().map(|s| s.port).collect();
+        assert_eq!(ports, [22, 445]);
+
+        // While running (or stopped), nothing is removed yet.
+        let mut h = online_host_with_discovery_services();
+        h.apply_ports(
+            &selection,
+            &set,
+            &report(false, vec![entry(22, PortState::Open, None)]),
+        );
+        assert_eq!(h.services.len(), 3);
+        assert!(!h.port_scan.as_ref().unwrap().complete);
+
+        // Neither if the list of open ports was cut (too many to list).
+        let mut truncated = scanned.clone();
+        truncated.open = 2000;
+        let mut h = online_host_with_discovery_services();
+        h.apply_ports(&selection, &set, &truncated);
+        assert_eq!(h.services.len(), 3);
+    }
+
+    #[test]
+    fn port_target_takes_over_definite_discovery_answers() {
+        let mut h = host();
+        h.probed_ports = vec![
+            (21, PortState::Closed),
+            (22, PortState::Open),
+            (443, PortState::Filtered),
+        ];
+        let target = h.port_target();
+        assert_eq!(target.ip, h.ip);
+        assert_eq!(target.known, [(21, Probe::Closed), (22, Probe::OPEN)]);
     }
 }

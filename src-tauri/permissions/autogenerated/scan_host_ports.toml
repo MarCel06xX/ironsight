@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-scan-host-ports"
+description = "Enables the scan_host_ports command without any pre-configured scope."
+commands.allow = ["scan_host_ports"]
+
+[[permission]]
+identifier = "deny-scan-host-ports"
+description = "Denies the scan_host_ports command without any pre-configured scope."
+commands.deny = ["scan_host_ports"]

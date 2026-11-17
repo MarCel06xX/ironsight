@@ -12,9 +12,11 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 
 use super::PortState;
+use super::banner::{self, Details};
 use super::names::service_name;
 use super::probe::{self, Connect};
 use super::spec::PortSet;
+use crate::scan::HttpInfo;
 use crate::scan::engine::{cancelled, now_ms};
 
 pub const DEFAULT_TIMEOUT_MS: u32 = 1000;
@@ -149,13 +151,22 @@ pub fn check_probes(hosts: usize, ports: usize, max: u64) -> Result<u64, PortSca
 }
 
 /// Result of one probe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
-    Open,
+    /// Open, with what the banner grab found (empty if it was off or found nothing).
+    Open(Details),
     Closed,
     Filtered,
     /// Local error; says nothing about the port.
     Failed,
+}
+
+impl Probe {
+    /// Open, without details.
+    pub const OPEN: Self = Self::Open(Details {
+        banner: None,
+        http: None,
+    });
 }
 
 /// Probes one port; implemented by [`TcpProber`].
@@ -163,17 +174,39 @@ pub trait PortProber: Send + Sync + 'static {
     fn probe(&self, addr: SocketAddr, timeout: Duration) -> impl Future<Output = Probe> + Send;
 }
 
-/// TCP connect probe (see [`probe::connect`]).
-pub struct TcpProber;
+/// TCP connect probe (see [`probe::connect`]) with optional banner grabbing on open ports.
+pub struct TcpProber {
+    pub banners: bool,
+}
 
 impl PortProber for TcpProber {
     async fn probe(&self, addr: SocketAddr, timeout: Duration) -> Probe {
         match probe::connect(addr, timeout).await {
+            Connect::Open(stream) if self.banners => {
+                Probe::Open(banner::grab(addr, stream, timeout).await)
+            }
             // Dropping the stream resets the connection right away.
-            Connect::Open(_stream) => Probe::Open,
+            Connect::Open(_stream) => Probe::OPEN,
             Connect::Closed => Probe::Closed,
             Connect::Filtered => Probe::Filtered,
-            Connect::Failed(_) => Probe::Failed,
+            Connect::Failed => Probe::Failed,
+        }
+    }
+}
+
+/// A host to scan, with the answers already known for some of its ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortTarget {
+    pub ip: IpAddr,
+    /// Taken over instead of probed again (only ports of the scanned set count).
+    pub known: Vec<(u16, Probe)>,
+}
+
+impl From<IpAddr> for PortTarget {
+    fn from(ip: IpAddr) -> Self {
+        Self {
+            ip,
+            known: Vec::new(),
         }
     }
 }
@@ -185,19 +218,23 @@ pub struct PortEntry {
     pub state: PortState,
     /// Service usually found on this port (display only).
     pub service: Option<&'static str>,
+    /// Cleaned greeting of the service (open ports only).
+    pub banner: Option<String>,
+    /// HTTP status, server and title (open HTTP ports only).
+    pub http: Option<HttpInfo>,
 }
 
 /// Port scan result of one host. Sent while the host is being scanned and once more when it
-/// is done or stopped; the frontend treats it as an upsert keyed by `ip`.
+/// is done or stopped; consumers treat it as an upsert keyed by `ip`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostPorts {
     pub ip: IpAddr,
     /// Every port has been probed. `false` while running and for hosts stopped by a cancel.
     pub complete: bool,
-    /// Ports probed so far.
+    /// Ports with a result so far (including results taken over).
     pub probed: u32,
-    /// Ports to probe.
+    /// Ports in the scanned set.
     pub total: u32,
     /// Ascending: open ports (up to [`MAX_LISTED_OPEN`]), closed and filtered ports while
     /// there are at most [`MAX_LISTED_OTHER`] of that state.
@@ -217,7 +254,7 @@ pub struct PortBatch {
     pub hosts: Vec<HostPorts>,
     /// Probes finished so far.
     pub done: u64,
-    /// Probes overall (hosts x ports).
+    /// Probes to make overall (hosts x ports, minus results taken over).
     pub total: u64,
 }
 
@@ -238,12 +275,13 @@ pub struct PortScanSummary {
     pub finished_at_ms: u64,
 }
 
-/// Probes `ports` on every host in `hosts` and reports results through `on_batch` while
-/// running. Refuses scans above `config.max_probes`. Setting `cancel` to `true` stops the
-/// scan: no new probes are started and the ones in flight are dropped (closing their sockets).
+/// Probes `ports` on every target and reports results through `on_batch` while running.
+/// Refuses scans above `config.max_probes` (counted as hosts x ports). Setting `cancel` to
+/// `true` stops the scan: no new probes are started and the ones in flight are dropped
+/// (closing their sockets).
 pub async fn scan_ports<P, F>(
     prober: Arc<P>,
-    hosts: Vec<IpAddr>,
+    targets: Vec<PortTarget>,
     ports: Arc<PortSet>,
     config: PortScanConfig,
     cancel: watch::Receiver<bool>,
@@ -254,7 +292,7 @@ where
     P: PortProber,
     F: Fn(PortBatch) + Send,
 {
-    let total = check_probes(hosts.len(), ports.len(), config.max_probes)?;
+    check_probes(targets.len(), ports.len(), config.max_probes)?;
     let started_at_ms = now_ms();
     let concurrency = config.concurrency.max(1);
     let per_host = config
@@ -265,10 +303,27 @@ where
     // instead of all at the end.
     let parallel_hosts = concurrency.div_ceil(per_host);
     let port_count = u32::try_from(ports.len()).unwrap_or(u32::MAX);
-    let mut states: Vec<HostState> = hosts
-        .iter()
-        .map(|&ip| HostState::new(ip, port_count))
-        .collect();
+
+    let mut states = Vec::with_capacity(targets.len());
+    let mut jobs = Vec::with_capacity(targets.len());
+    let mut total = 0u64;
+    for target in targets {
+        let mut state = HostState::new(target.ip, port_count);
+        let mut skip: Vec<u16> = Vec::new();
+        for (port, probe) in target.known {
+            if ports.contains(port) && !skip.contains(&port) {
+                state.record(port, probe);
+                skip.push(port);
+            }
+        }
+        skip.sort_unstable();
+        total += (ports.len() - skip.len()) as u64;
+        states.push(state);
+        jobs.push(HostJob {
+            ip: target.ip,
+            skip,
+        });
+    }
 
     let ctx = Arc::new(Ctx {
         prober,
@@ -279,7 +334,7 @@ where
         cancel: cancel.clone(),
     });
     let (tx, mut rx) = mpsc::channel::<Msg>(1024);
-    let producer = tokio::spawn(produce(ctx, hosts, parallel_hosts, tx));
+    let producer = tokio::spawn(produce(ctx, jobs, parallel_hosts, tx));
 
     let mut done = 0u64;
     let mut dirty: Vec<usize> = Vec::new();
@@ -349,7 +404,7 @@ where
         hosts_complete: count_u32(states.iter().filter(|s| s.complete).count()),
         done,
         total,
-        open: states.iter().map(|s| s.open.count).sum(),
+        open: states.iter().map(|s| s.open_count).sum(),
         errors: states.iter().map(|s| s.errors).sum(),
         started_at_ms,
         finished_at_ms: now_ms(),
@@ -387,23 +442,29 @@ struct Ctx<P> {
     cancel: watch::Receiver<bool>,
 }
 
+/// One host and the ports not to probe (results taken over), sorted.
+struct HostJob {
+    ip: IpAddr,
+    skip: Vec<u16>,
+}
+
 /// Starts one task per host; at most `parallel_hosts` hosts are scanned at the same time.
 async fn produce<P: PortProber>(
     ctx: Arc<Ctx<P>>,
-    hosts: Vec<IpAddr>,
+    jobs: Vec<HostJob>,
     parallel_hosts: usize,
     tx: mpsc::Sender<Msg>,
 ) {
     let slots = Arc::new(Semaphore::new(parallel_hosts));
     let mut cancel = ctx.cancel.clone();
-    for (index, ip) in hosts.into_iter().enumerate() {
+    for (index, job) in jobs.into_iter().enumerate() {
         let slot = tokio::select! {
             biased;
             _ = cancelled(&mut cancel) => break,
             slot = Arc::clone(&slots).acquire_owned() => slot,
         };
         let Ok(slot) = slot else { break };
-        tokio::spawn(scan_host(Arc::clone(&ctx), index, ip, tx.clone(), slot));
+        tokio::spawn(scan_host(Arc::clone(&ctx), index, job, tx.clone(), slot));
     }
 }
 
@@ -412,12 +473,16 @@ async fn produce<P: PortProber>(
 async fn scan_host<P: PortProber>(
     ctx: Arc<Ctx<P>>,
     index: usize,
-    ip: IpAddr,
+    job: HostJob,
     tx: mpsc::Sender<Msg>,
     _slot: OwnedSemaphorePermit,
 ) {
+    let HostJob { ip, skip } = job;
     let mut cancel = ctx.cancel.clone();
-    let mut ports = ctx.ports.iter();
+    let mut ports = ctx
+        .ports
+        .iter()
+        .filter(|port| skip.binary_search(port).is_err());
     let mut running: JoinSet<(u16, Probe)> = JoinSet::new();
     let complete = 'scan: loop {
         while running.len() < ctx.per_host {
@@ -467,7 +532,7 @@ async fn scan_host<P: PortProber>(
         .await;
 }
 
-/// Ports of one state on one host: counted, and listed up to a limit.
+/// Closed or filtered ports of one host: counted, and listed while there are few.
 #[derive(Debug, Default)]
 struct Tally {
     count: u32,
@@ -475,18 +540,9 @@ struct Tally {
 }
 
 impl Tally {
-    /// Keeps the first `limit` ports.
-    fn add_truncating(&mut self, port: u16, limit: usize) {
+    fn add(&mut self, port: u16) {
         self.count += 1;
-        if self.ports.len() < limit {
-            self.ports.push(port);
-        }
-    }
-
-    /// Lists the ports only while there are at most `limit`.
-    fn add_while_few(&mut self, port: u16, limit: usize) {
-        self.count += 1;
-        if self.count as usize <= limit {
+        if self.count as usize <= MAX_LISTED_OTHER {
             self.ports.push(port);
         } else if !self.ports.is_empty() {
             self.ports = Vec::new();
@@ -499,7 +555,9 @@ struct HostState {
     total: u32,
     probed: u32,
     complete: bool,
-    open: Tally,
+    /// The first [`MAX_LISTED_OPEN`] open ports with their details.
+    open: Vec<(u16, Details)>,
+    open_count: u32,
     closed: Tally,
     filtered: Tally,
     errors: u32,
@@ -514,7 +572,8 @@ impl HostState {
             total,
             probed: 0,
             complete: false,
-            open: Tally::default(),
+            open: Vec::new(),
+            open_count: 0,
             closed: Tally::default(),
             filtered: Tally::default(),
             errors: 0,
@@ -525,9 +584,14 @@ impl HostState {
     fn record(&mut self, port: u16, probe: Probe) {
         self.probed += 1;
         match probe {
-            Probe::Open => self.open.add_truncating(port, MAX_LISTED_OPEN),
-            Probe::Closed => self.closed.add_while_few(port, MAX_LISTED_OTHER),
-            Probe::Filtered => self.filtered.add_while_few(port, MAX_LISTED_OTHER),
+            Probe::Open(details) => {
+                self.open_count += 1;
+                if self.open.len() < MAX_LISTED_OPEN {
+                    self.open.push((port, details));
+                }
+            }
+            Probe::Closed => self.closed.add(port),
+            Probe::Filtered => self.filtered.add(port),
             Probe::Failed => self.errors += 1,
         }
     }
@@ -538,20 +602,27 @@ impl HostState {
     }
 
     fn report(&self) -> HostPorts {
-        let entry = |state: PortState| {
+        let other = |state: PortState| {
             move |&port: &u16| PortEntry {
                 port,
                 state,
                 service: service_name(port),
+                banner: None,
+                http: None,
             }
         };
         let mut ports: Vec<PortEntry> = self
             .open
-            .ports
             .iter()
-            .map(entry(PortState::Open))
-            .chain(self.closed.ports.iter().map(entry(PortState::Closed)))
-            .chain(self.filtered.ports.iter().map(entry(PortState::Filtered)))
+            .map(|(port, details)| PortEntry {
+                port: *port,
+                state: PortState::Open,
+                service: service_name(*port),
+                banner: details.banner.clone(),
+                http: details.http.clone(),
+            })
+            .chain(self.closed.ports.iter().map(other(PortState::Closed)))
+            .chain(self.filtered.ports.iter().map(other(PortState::Filtered)))
             .collect();
         ports.sort_unstable_by_key(|entry| entry.port);
         HostPorts {
@@ -560,7 +631,7 @@ impl HostState {
             probed: self.probed,
             total: self.total,
             ports,
-            open: self.open.count,
+            open: self.open_count,
             closed: self.closed.count,
             filtered: self.filtered.count,
             errors: self.errors,
@@ -620,7 +691,7 @@ mod tests {
             Self {
                 answers: answers
                     .iter()
-                    .map(|&(ip, port, probe)| (SocketAddr::new(ip, port), probe))
+                    .map(|(ip, port, probe)| (SocketAddr::new(*ip, *port), probe.clone()))
                     .collect(),
                 ..Self::default()
             }
@@ -642,7 +713,7 @@ mod tests {
         async fn probe(&self, addr: SocketAddr, _timeout: Duration) -> Probe {
             let _guard = self.enter(addr.ip());
             tokio::time::sleep(self.delay).await;
-            self.answers.get(&addr).copied().unwrap_or(Probe::Closed)
+            self.answers.get(&addr).cloned().unwrap_or(Probe::Closed)
         }
     }
 
@@ -680,9 +751,9 @@ mod tests {
     }
 
     /// Runs a scan; `cancel_after` stops it after that delay (zero: before it starts).
-    async fn scan<P: PortProber>(
+    async fn scan<P: PortProber, T: Into<PortTarget>>(
         prober: Arc<P>,
-        hosts: Vec<IpAddr>,
+        hosts: Vec<T>,
         ports: &str,
         config: PortScanConfig,
         cancel_after: Option<Duration>,
@@ -701,7 +772,7 @@ mod tests {
         let sink = Arc::clone(&batches);
         let summary = scan_ports(
             prober,
-            hosts,
+            hosts.into_iter().map(Into::into).collect(),
             Arc::new(PortSet::parse(ports).unwrap()),
             config,
             cancel_rx,
@@ -721,8 +792,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reports_every_state() {
         let prober = Arc::new(MockProber::with(&[
-            (ip(1), 22, Probe::Open),
-            (ip(1), 80, Probe::Open),
+            (ip(1), 22, Probe::OPEN),
+            (ip(1), 80, Probe::OPEN),
             (ip(1), 443, Probe::Filtered),
             (ip(1), 23, Probe::Failed),
             (ip(2), 21, Probe::Filtered),
@@ -771,7 +842,7 @@ mod tests {
         let host = ip(1);
         // 1-100: 22 open, 1-59 except 22 filtered (58), 60-100 closed (41).
         let mut answers: Vec<_> = (1..60).map(|p| (host, p, Probe::Filtered)).collect();
-        answers.push((host, 22, Probe::Open));
+        answers.push((host, 22, Probe::OPEN));
         let run = scan(
             Arc::new(MockProber::with(&answers)),
             vec![host],
@@ -787,7 +858,7 @@ mod tests {
         // A small minority stays listed.
         let mut answers: Vec<_> = (1..=100).map(|p| (host, p, Probe::Filtered)).collect();
         answers[9].2 = Probe::Closed; // port 10
-        answers[20].2 = Probe::Open; // port 21
+        answers[20].2 = Probe::OPEN; // port 21
         let run = scan(
             Arc::new(MockProber::with(&answers)),
             vec![host],
@@ -807,7 +878,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn open_port_list_is_capped_but_counted() {
         let host = ip(1);
-        let answers: Vec<_> = (1..=1100).map(|p| (host, p, Probe::Open)).collect();
+        let answers: Vec<_> = (1..=1100).map(|p| (host, p, Probe::OPEN)).collect();
         let run = scan(
             Arc::new(MockProber::with(&answers)),
             vec![host],
@@ -1005,7 +1076,7 @@ mod tests {
     async fn no_hosts_is_an_empty_scan() {
         let run = scan(
             Arc::new(MockProber::default()),
-            Vec::new(),
+            Vec::<IpAddr>::new(),
             "1-100",
             config(16, 4),
             None,
@@ -1049,7 +1120,7 @@ mod tests {
     #[test]
     fn serializes_camel_case_for_the_frontend() {
         let mut state = HostState::new(ip(1), 3);
-        state.record(3389, Probe::Open);
+        state.record(3389, Probe::OPEN);
         state.record(81, Probe::Closed);
         state.record(5, Probe::Filtered);
         state.complete = true;
@@ -1062,15 +1133,138 @@ mod tests {
                 "probed": 3,
                 "total": 3,
                 "ports": [
-                    {"port": 5, "state": "filtered", "service": null},
-                    {"port": 81, "state": "closed", "service": "http-alt"},
-                    {"port": 3389, "state": "open", "service": "rdp"},
+                    {"port": 5, "state": "filtered", "service": null, "banner": null, "http": null},
+                    {"port": 81, "state": "closed", "service": "http-alt", "banner": null, "http": null},
+                    {"port": 3389, "state": "open", "service": "rdp", "banner": null, "http": null},
                 ],
                 "open": 1,
                 "closed": 1,
                 "filtered": 1,
                 "errors": 0,
             })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn known_answers_are_taken_over_not_probed() {
+        let prober = Arc::new(MockProber::with(&[(ip(1), 21, Probe::OPEN)]));
+        let target = PortTarget {
+            ip: ip(1),
+            known: vec![
+                (22, Probe::OPEN),
+                (23, Probe::Closed),
+                // Repeated, and outside the scanned set: ignored.
+                (22, Probe::Closed),
+                (9999, Probe::OPEN),
+            ],
+        };
+        let run = scan(
+            Arc::clone(&prober),
+            vec![target],
+            "21-23,80",
+            config(16, 4),
+            None,
+        )
+        .await;
+        // Only 21 and 80 were probed.
+        assert_eq!(prober.probes.load(Ordering::SeqCst), 2);
+        let summary = run.summary();
+        assert_eq!((summary.done, summary.total), (2, 2));
+        assert_eq!(summary.open, 2);
+        let report = run.last(ip(1));
+        assert!(report.complete);
+        assert_eq!((report.probed, report.total), (4, 4));
+        assert_eq!(
+            states(&report),
+            [
+                (21, PortState::Open),
+                (22, PortState::Open),
+                (23, PortState::Closed),
+                (80, PortState::Closed),
+            ]
+        );
+        // Progress counts only the probes made.
+        assert!(run.batches.iter().all(|b| b.total == 2));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_with_everything_known_is_reported_complete() {
+        let prober = Arc::new(MockProber::default());
+        let target = PortTarget {
+            ip: ip(1),
+            known: vec![(22, Probe::OPEN), (80, Probe::Closed)],
+        };
+        let run = scan(
+            Arc::clone(&prober),
+            vec![target],
+            "22,80",
+            config(16, 4),
+            None,
+        )
+        .await;
+        assert_eq!(prober.probes.load(Ordering::SeqCst), 0);
+        let report = run.last(ip(1));
+        assert!(report.complete);
+        assert_eq!((report.open, report.closed), (1, 1));
+        assert_eq!((run.summary().done, run.summary().total), (0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn banner_details_are_reported_with_open_ports() {
+        let ssh = Probe::Open(Details {
+            banner: Some("SSH-2.0-OpenSSH_9.6".into()),
+            http: None,
+        });
+        let web = Probe::Open(Details {
+            banner: None,
+            http: Some(HttpInfo {
+                status: Some(200),
+                server: Some("nginx".into()),
+                title: Some("Router".into()),
+            }),
+        });
+        let prober = Arc::new(MockProber::with(&[(ip(1), 22, ssh), (ip(1), 80, web)]));
+        let run = scan(prober, vec![ip(1)], "22,80,443", config(16, 4), None).await;
+        let report = run.last(ip(1));
+        assert_eq!(
+            report.ports[0].banner.as_deref(),
+            Some("SSH-2.0-OpenSSH_9.6")
+        );
+        assert_eq!(report.ports[0].http, None);
+        let http = report.ports[1].http.as_ref().unwrap();
+        assert_eq!(http.title.as_deref(), Some("Router"));
+        assert_eq!(report.ports[2].state, PortState::Closed);
+        assert_eq!(report.ports[2].banner, None);
+    }
+
+    /// The real prober with banner grabbing: a service that greets is read passively.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_scan_grabs_banners() {
+        use tokio::io::AsyncWriteExt;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"220 test FTP \x1b[1mready\x1b[0m\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let run = scan(
+            Arc::new(TcpProber { banners: true }),
+            vec![localhost],
+            &port.to_string(),
+            PortScanConfig::default(),
+            None,
+        )
+        .await;
+        let report = run.last(localhost);
+        assert_eq!(report.open, 1);
+        assert_eq!(
+            report.ports[0].banner.as_deref(),
+            Some("220 test FTP ready")
         );
     }
 
@@ -1087,7 +1281,7 @@ mod tests {
         let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let started = Instant::now();
         let run = scan(
-            Arc::new(TcpProber),
+            Arc::new(TcpProber { banners: false }),
             vec![localhost],
             &format!("{a},{b},{closed}"),
             PortScanConfig::default(),
@@ -1144,8 +1338,8 @@ mod live {
         let batches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&batches);
         let summary = scan_ports(
-            Arc::new(TcpProber),
-            vec![host],
+            Arc::new(TcpProber { banners: true }),
+            vec![PortTarget::from(host)],
             Arc::new(PortPreset::Top1000.ports()),
             PortScanConfig::default(),
             cancelled,
@@ -1153,8 +1347,10 @@ mod live {
             move |batch| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for h in batch.hosts.iter().filter(|h| h.complete) {
+                    let banners = h.ports.iter().filter(|p| p.banner.is_some()).count();
+                    let titles = h.ports.iter().filter(|p| p.http.is_some()).count();
                     println!(
-                        "open={} closed={} filtered={} errors={} listed={}",
+                        "open={} closed={} filtered={} errors={} listed={} banners={banners} http={titles}",
                         h.open,
                         h.closed,
                         h.filtered,

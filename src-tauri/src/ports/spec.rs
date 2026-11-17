@@ -5,8 +5,6 @@ use std::fmt;
 
 /// Longest accepted input in bytes; enough for a few hundred single ports.
 pub const MAX_SPEC_LEN: usize = 2048;
-/// Number of ports in `1-65535`.
-pub const ALL_PORTS: usize = 65_535;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PortSpecError {
@@ -119,10 +117,6 @@ impl PortSet {
         self.count
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
     pub fn contains(&self, port: u16) -> bool {
         let at = self.ranges.partition_point(|&(_, hi)| hi < port);
         self.ranges.get(at).is_some_and(|&(lo, _)| lo <= port)
@@ -198,6 +192,9 @@ fn echo(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Number of ports in `1-65535`.
+    const ALL_PORTS: usize = 65_535;
+
     fn ports(input: &str) -> Vec<u16> {
         PortSet::parse(input).unwrap().iter().collect()
     }
@@ -271,7 +268,6 @@ mod tests {
     fn contains_and_len() {
         let set = PortSet::parse("22,80-90,443").unwrap();
         assert_eq!(set.len(), 13);
-        assert!(!set.is_empty());
         for port in [22, 80, 85, 90, 443] {
             assert!(set.contains(port), "{port}");
         }
@@ -284,7 +280,7 @@ mod tests {
     fn from_ports_dedups_and_ignores_zero() {
         let set = PortSet::from_ports([443, 0, 22, 443, 23]);
         assert_eq!(set.iter().collect::<Vec<_>>(), [22, 23, 443]);
-        assert!(PortSet::from_ports([]).is_empty());
+        assert_eq!(PortSet::from_ports([]).len(), 0);
     }
 
     #[test]

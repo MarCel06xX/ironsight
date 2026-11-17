@@ -9,8 +9,6 @@ mod known;
 mod mac;
 mod platform;
 mod portable;
-// Not wired into the commands yet (port scan phase 2).
-#[allow(dead_code)]
 mod ports;
 mod scan;
 mod settings;
@@ -60,6 +58,7 @@ pub fn run() {
             commands::open_release_page,
             commands::import_scan,
             commands::forget_known_devices,
+            commands::scan_host_ports,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

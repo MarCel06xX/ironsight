@@ -12,9 +12,12 @@ the updater was tested end to end (0.1.2 -> 0.1.3). Releases only after the user
 **In progress: TCP port scanner, to be released as v0.4.0** (user's version number), in 5 phases;
 commit + push after each phase, then stop and wait for the user's go.
 - Phase 1 (backend engine) **done**: `ports/` module, see "Port scanning" below.
-- Next: phase 2 banner grabbing + pipeline integration (Tauri events, replace the fixed 9-port
-  probe), phase 3 UI, phase 4 export/import (`schema_version` 3, fixtures for 1 and 2), phase 5
-  README/CHANGELOG/version bump (do NOT run `scripts/release.ps1`).
+- Phase 2 (banners + pipeline) **done**: port step after discovery, `scan_host_ports`,
+  `ports:*` events, merged discovery check. Backend + `api.ts` types only, no UI yet.
+- Next: phase 3 UI (settings incl. persisted port options, column, detail table, context menu,
+  progress, one-time authorization notice, DE/EN, 5 themes), phase 4 export/import
+  (`schema_version` 3, fixtures for 1 and 2), phase 5 README/CHANGELOG/version bump (do NOT run
+  `scripts/release.ps1`).
 
 Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), packet
 capture, Linux backend.
@@ -136,9 +139,14 @@ can no longer update.
 - `wire.rs` DNS message builder/parser (PTR only; compression with backward-only pointers, jump
   limit, RDATA bounds) shared by `dns.rs` (system DNS servers, max 2) and `mdns.rs` (unicast
   one-shot query to `<ip>:5353`, on-link hosts only). `netbios.rs` NBSTAT `*` query on UDP 137.
-- `services.rs`: TCP connect on 21,22,23,80,443,445,3389,8080,8443; HTTP/1.0 `GET /` on 80/8080
-  only, max 64 KiB, max 3 redirects and only same host+port (never follow to other hosts).
-  HTTPS titles need a TLS crate -> not added, ask the user first.
+- `services.rs`: discovery TCP check on `DISCOVERY_PORTS` 21,22,23,80,443,445,3389,8080,8443
+  with the tuned `ports::probe::connect`; per-port answers kept in `HostResult.probed_ports`
+  (`#[serde(skip)]`). Only an *open* port makes a host online (an RST does not: some firewalls
+  reset for nonexistent hosts). HTTP/1.0 `GET /` (`http_info`, shared with the port scan) on
+  ports named `http`/`http-alt`, max 64 KiB, max 3 redirects and only same host+port (never
+  follow to other hosts). HTTPS titles need a TLS crate -> not added, ask the user first.
+- Enrichment (`NetEnricher::new(adapters, banners)`): with `banners` on (default) it reads HTTP
+  titles and passive banners of the discovery check's open ports; off = neither.
 - `oui.rs`: binary table `src-tauri/data/oui.bin` (`IOUI` v1, sorted 3-byte prefixes + u24 name
   offsets, ~700 KB), built by `npm run update-oui` (`tools/oui/update-oui.mjs`; raw CSV never in
   context). Locally administered MACs (bit 0x02) get `macLocal: true` and no vendor.
@@ -186,7 +194,7 @@ can no longer update.
 ## Port scanning (v0.4.0, `src-tauri/src/ports/`)
 
 TCP connect scan only: no Npcap, no admin rights, no raw sockets. Tauri-free like the scan
-engine; `mod ports` has `#[allow(dead_code)]` in `lib.rs` until phase 2 wires it into commands.
+engine; the Tauri glue is in `commands.rs`.
 - `spec.rs` `PortSet` = merged inclusive `u16` ranges. Input: comma list of `N` / `A-B`,
   whitespace around entries and `-` allowed; strict otherwise: no empty entries (`22,,80`,
   trailing comma), ASCII digits only, no leading zeros, 1-65535, no open ranges, max 2048 bytes.
@@ -214,8 +222,9 @@ engine; `mod ports` has `#[allow(dead_code)]` in `lib.rs` until phase 2 wires it
 - **TIME_WAIT**: `TcpSocket::set_zero_linger()` (SO_LINGER 0) -> closing an open port sends RST,
   no TIME_WAIT (verified: Top 1000 on the router with 10 open ports left 0 entries, one plain
   connect+close leaves 1). Ephemeral range is 16,384 ports. Don't use deprecated `set_linger`.
-- `scanner.rs` `scan_ports(prober, hosts, ports, config, cancel, scan_id, on_batch)`:
-  `PortProber` trait (real `TcpProber`, tests use a mock). Limits: timeout 100-10,000 ms (1000),
+- `scanner.rs` `scan_ports(prober, targets, ports, config, cancel, scan_id, on_batch)`:
+  `PortProber` trait (real `TcpProber { banners }`, tests use a mock). `PortTarget { ip, known }`:
+  known answers are taken over, not probed (progress `total` excludes them). Limits: timeout 100-10,000 ms (1000),
   concurrency 1-1024 (256, global semaphore), per host 1-256 (32, clamped to concurrency and port
   count); hosts in parallel = ceil(concurrency / per host) so hosts finish one after another.
   Cap hosts x ports: default 1,000,000 (a /24 with Top 1000 fits), configurable up to 2^24;
@@ -226,6 +235,41 @@ engine; `mod ports` has `#[allow(dead_code)]` in `lib.rs` until phase 2 wires it
   hosts; `HostPorts` is an upsert by IP (`complete`, `probed/total`, counts `open/closed/
   filtered/errors`, `ports[]` = open ports up to 1024 + closed/filtered ports while <= 32 of that
   state, like "997 closed"). `PortScanSummary` at the end.
+- `banner.rs` (phase 2): per port `method()`: `Http` for ports named `http`/`http-alt` (reuses
+  `services::http_info`, no duplicate HTTP code), `None` for client-first ports (`CLIENT_FIRST`:
+  TLS-wrapped, RPC/SMB/RDP, DNS, LDAP, Kerberos), `Passive` for everything else - we never send
+  a byte to non-HTTP ports (also safe for raw printer ports like 9100). Passive read: wait
+  `greeting_wait` = probe timeout clamped 0.5-2 s for the first bytes, then 200 ms idle gap, at
+  most +1 s and 1024 bytes. `sanitize`: drop a UTF-8 char cut at the end, strip Telnet IAC and
+  ANSI CSI sequences, lossy UTF-8 (Latin-1 umlauts are lost, binary junk is not shown as
+  letters); with binary parts only printable runs >= 4 chars stay (`strings`-like, keeps e.g.
+  the MySQL version); then `clean_text` (one line, no controls/bidi) capped at 256 chars.
+  Frontend/exports escape it (untrusted).
+- **Merge with the old 9-port probe** (no duplicate scanning): host discovery keeps its TCP check
+  (needed to find hosts that ignore ping behind a router) and records open/closed/filtered per
+  port. The port step takes over every definite answer (open/closed) via
+  `HostResult::port_target()` and re-probes only silent (filtered) ports - those may have been
+  lost to a slow first ARP. Banners of discovery-open ports come from the enrichment, so the port
+  step does not reconnect to them. "Scan ports..." on one host is a fresh scan (no take-over).
+- Data model: open ports stay in `HostResult.services` (`ServiceInfo` + `banner`), the rest in
+  `HostResult.port_scan: Option<PortScanInfo>` (`selection`, `complete`, counts, `listed`
+  closed/filtered). `PortSelection` = `{"preset":"top100"}` | `{"custom":"22,80"}` (custom stored
+  normalized). `HostResult::apply_ports`: new details win, discovery details stay if the scan has
+  none; ports of the scanned set that are not open any more are removed only when the report is
+  complete and not truncated. Status is never changed by a port scan.
+- Commands (phase 2): `ScanRequest` gets `banners?` (default true) and `ports?: PortScanOptions
+  { selection, timeoutMs?, concurrency?, perHost?, maxProbes? }`, validated before the scan
+  starts. Pipeline: discovery -> `finish_known` -> port step on the online hosts (skipped if
+  stopped) -> `end_scan` -> `ports:finished` -> `scan:finished`. `scan_host_ports({ ip, ports,
+  banners? })` (only IPs of the last scan, else `ports.unknown_host`) takes the scan slot
+  (`stop_scan` stops it), returns `{ scanId, total }`, sends `ports:batch`/`ports:finished`.
+- `ScanRecord.ports` keeps the latest `PortRecord` per IP next to the discovery hosts;
+  `effective()` = known data + `apply_ports`, so exports and rows include port results while
+  `record.hosts` stays discovery-only. Events: `ports:batch { scanId, hosts: HostResult[]
+  (upserts), done, total }` (engine-throttled, 250 ms), `ports:finished { scanId, summary,
+  error }` (`error` e.g. `ports.too_many_probes` when online hosts x ports exceed the cap).
+- Live check (Win 11, own /24): 14 online, 53 discovery answers taken over, Top 100 port step
+  1347 probes in 5.1 s in 11 batches; stop after 1.5 s ended at 1.51 s.
 
 ## Commands
 
@@ -235,6 +279,7 @@ cd src-tauri && cargo fmt && cargo clippy --all-targets -- -D warnings && cargo 
 cargo test live_scan -- --ignored --nocapture       # real scan of the local /24 (manual)
 cargo test connect_timing -- --ignored --nocapture  # plain vs tuned connect to a closed port
 cargo test live_port_scan -- --ignored --nocapture  # Top 1000 on own address (IRONSIGHT_PORTS_HOST=<ip>)
+cargo test live_scan_with_ports -- --ignored --nocapture  # /24 discovery + Top 100 (IRONSIGHT_STOP_AFTER_MS)
 npm run update-oui                                  # refresh the embedded IEEE OUI table
 npm run tauri dev                                   # user runs this
 ```

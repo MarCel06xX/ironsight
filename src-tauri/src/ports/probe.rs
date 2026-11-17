@@ -24,7 +24,7 @@ pub enum Connect {
     /// No answer within the timeout, or an ICMP "unreachable".
     Filtered,
     /// Local error; says nothing about the port.
-    Failed(io::Error),
+    Failed,
 }
 
 /// Connects to `addr`, waiting at most `timeout` for an answer.
@@ -63,7 +63,7 @@ fn classify(e: io::Error) -> Connect {
     match e.kind() {
         ConnectionRefused | ConnectionReset => Connect::Closed,
         TimedOut | HostUnreachable | NetworkUnreachable => Connect::Filtered,
-        _ => Connect::Failed(e),
+        _ => Connect::Failed,
     }
 }
 
@@ -153,7 +153,7 @@ mod tests {
         let state = |kind: io::ErrorKind| match classify(kind.into()) {
             Connect::Closed => "closed",
             Connect::Filtered => "filtered",
-            Connect::Failed(_) => "failed",
+            Connect::Failed => "failed",
             Connect::Open(_) => unreachable!(),
         };
         assert_eq!(state(ConnectionRefused), "closed");

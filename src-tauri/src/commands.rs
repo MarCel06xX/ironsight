@@ -23,6 +23,12 @@ use crate::known::{self, KnownDevices, LiveSet};
 use crate::mac::MacAddr;
 use crate::platform::{self, Adapter, NetBackend};
 use crate::portable::{self, PortableState};
+use crate::ports::PortSelection;
+use crate::ports::scanner::{
+    self, HostPorts, PortBatch, PortScanConfig, PortScanSummary, PortTarget, TcpProber,
+    check_probes, scan_ports,
+};
+use crate::ports::spec::PortSet;
 use crate::scan::engine::{now_ms, run_scan};
 use crate::scan::range::{MAX_HOSTS, TargetSet};
 use crate::scan::{
@@ -33,6 +39,8 @@ use crate::settings::{self, Settings};
 
 pub const EVENT_SCAN_BATCH: &str = "scan:batch";
 pub const EVENT_SCAN_FINISHED: &str = "scan:finished";
+pub const EVENT_PORTS_BATCH: &str = "ports:batch";
+pub const EVENT_PORTS_FINISHED: &str = "ports:finished";
 
 struct ActiveScan {
     id: u64,
@@ -48,6 +56,15 @@ struct ScanRecord {
     live: LiveSet,
     /// Silent addresses currently shown with known-device data.
     known_applied: HashSet<IpAddr>,
+    /// Latest port scan result per host (pipeline step or "Scan ports…").
+    ports: HashMap<IpAddr, PortRecord>,
+}
+
+/// A port scan report with what was scanned.
+struct PortRecord {
+    selection: PortSelection,
+    set: Arc<PortSet>,
+    report: HostPorts,
 }
 
 impl ScanRecord {
@@ -58,6 +75,7 @@ impl ScanRecord {
             hosts: HashMap::new(),
             live: LiveSet::default(),
             known_applied: HashSet::new(),
+            ports: HashMap::new(),
         }
     }
 
@@ -66,8 +84,18 @@ impl ScanRecord {
         self.hosts.insert(host.ip, host);
     }
 
-    /// The host as shown: silent addresses get known-device data.
+    /// The host as shown: silent addresses get known-device data, port-scanned hosts their
+    /// port results.
     fn effective(&self, host: &HostResult, known: &KnownDevices) -> HostResult {
+        let mut shown = self.with_known(host, known);
+        if let Some(ports) = self.ports.get(&host.ip) {
+            shown.apply_ports(&ports.selection, &ports.set, &ports.report);
+        }
+        shown
+    }
+
+    /// Silent addresses with known-device data, everything else as found.
+    fn with_known(&self, host: &HostResult, known: &KnownDevices) -> HostResult {
         if host.online {
             return host.clone();
         }
@@ -84,17 +112,49 @@ impl ScanRecord {
         let mut changed = Vec::new();
         let mut applied = HashSet::new();
         for host in self.hosts.values().filter(|h| !h.online) {
-            let shown = self.effective(host, known);
-            if shown != *host {
+            if self.with_known(host, known) != *host {
                 applied.insert(host.ip);
-                changed.push(shown);
+                changed.push(self.effective(host, known));
             } else if self.known_applied.contains(&host.ip) {
-                changed.push(shown);
+                changed.push(self.effective(host, known));
             }
         }
         self.known_applied = applied;
         changed.sort_by_key(|host| host.ip);
         changed
+    }
+
+    /// Keeps port scan reports of hosts in this scan and returns those hosts as shown.
+    fn add_ports(
+        &mut self,
+        selection: &PortSelection,
+        set: &Arc<PortSet>,
+        reports: Vec<HostPorts>,
+        known: &KnownDevices,
+    ) -> Vec<HostResult> {
+        let mut shown = Vec::with_capacity(reports.len());
+        for report in reports {
+            let ip = report.ip;
+            if !self.hosts.contains_key(&ip) {
+                continue;
+            }
+            let record = PortRecord {
+                selection: selection.clone(),
+                set: Arc::clone(set),
+                report,
+            };
+            self.ports.insert(ip, record);
+            shown.push(self.effective(&self.hosts[&ip], known));
+        }
+        shown
+    }
+
+    /// Port scan targets after host discovery: every host that answered, ascending, with
+    /// the answers of the discovery TCP check.
+    fn port_targets(&self) -> Vec<PortTarget> {
+        let mut online: Vec<&HostResult> = self.hosts.values().filter(|h| h.online).collect();
+        online.sort_by_key(|host| host.ip);
+        online.into_iter().map(HostResult::port_target).collect()
     }
 
     /// All hosts sorted by address, or the given addresses in their order (unknown and
@@ -203,6 +263,35 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Stores port results of the running port scan; returns the changed rows.
+    fn record_ports(
+        &self,
+        selection: &PortSelection,
+        set: &Arc<PortSet>,
+        reports: Vec<HostPorts>,
+    ) -> Vec<HostResult> {
+        let known = self.known();
+        self.last_scan()
+            .as_mut()
+            .map(|record| record.add_ports(selection, set, reports, &known.devices))
+            .unwrap_or_default()
+    }
+
+    fn port_targets(&self, scan_id: u64) -> Vec<PortTarget> {
+        self.last_scan()
+            .as_ref()
+            .filter(|record| record.scan_id == scan_id)
+            .map(ScanRecord::port_targets)
+            .unwrap_or_default()
+    }
+
+    /// Whether `ip` is a row of the last scan.
+    fn has_host(&self, ip: IpAddr) -> bool {
+        self.last_scan()
+            .as_ref()
+            .is_some_and(|record| record.hosts.contains_key(&ip))
+    }
+
     fn active(&self) -> MutexGuard<'_, Option<ActiveScan>> {
         // The guarded data is a plain Option, so a poisoned lock is still usable.
         self.active.lock().unwrap_or_else(|e| e.into_inner())
@@ -242,6 +331,68 @@ pub struct ScanRequest {
     timeout_ms: Option<u32>,
     /// Reverse DNS for silent addresses (default: auto).
     offline_names: Option<OfflineNames>,
+    /// Read banners and HTTP titles of open ports (default: on).
+    banners: Option<bool>,
+    /// Port scan of the hosts that answered, after host discovery (default: none).
+    ports: Option<PortScanOptions>,
+}
+
+/// Port scan settings from the frontend; missing limits use the defaults.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortScanOptions {
+    selection: PortSelection,
+    timeout_ms: Option<u32>,
+    concurrency: Option<u32>,
+    per_host: Option<u32>,
+    max_probes: Option<u64>,
+}
+
+/// Validated port scan settings.
+#[derive(Debug, Clone)]
+struct PortPlan {
+    /// A custom list is kept in normalized form.
+    selection: PortSelection,
+    set: Arc<PortSet>,
+    config: PortScanConfig,
+}
+
+impl PortScanOptions {
+    fn plan(&self) -> Result<PortPlan, CommandError> {
+        let (selection, set) = self.selection.resolve()?;
+        let config = PortScanConfig::new(
+            self.timeout_ms.unwrap_or(scanner::DEFAULT_TIMEOUT_MS),
+            self.concurrency.unwrap_or(scanner::DEFAULT_CONCURRENCY),
+            self.per_host.unwrap_or(scanner::DEFAULT_PER_HOST),
+            self.max_probes.unwrap_or(scanner::DEFAULT_MAX_PROBES),
+        )?;
+        Ok(PortPlan {
+            selection,
+            set: Arc::new(set),
+            config,
+        })
+    }
+}
+
+/// `ports:batch`: hosts whose port results changed (complete rows, an upsert by IP) and the
+/// progress of the port scan in probes.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortsBatch {
+    scan_id: u64,
+    hosts: Vec<HostResult>,
+    done: u64,
+    total: u64,
+}
+
+/// `ports:finished`: end of a port scan. `error` if it was refused, e.g. above the probe
+/// limit (`ports.too_many_probes`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortsFinished {
+    scan_id: u64,
+    summary: Option<PortScanSummary>,
+    error: Option<CommandError>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,12 +444,19 @@ pub async fn start_scan(
     *state.last_scan() = None;
     let targets = TargetSet::parse(&request.targets)?;
     let mut config = scan_config(&request)?;
+    let port_plan = request
+        .ports
+        .as_ref()
+        .map(PortScanOptions::plan)
+        .transpose()?;
+    let banners = request.banners.unwrap_or(true);
     config.resolve_offline_names = request
         .offline_names
         .unwrap_or_default()
         .enabled_for(targets.len());
     let total = targets.len() as u32;
     let (scan_id, cancel) = state.begin_scan()?;
+    let port_cancel = cancel.clone();
     let backend = Arc::clone(&state.backend);
     *state.last_scan() = Some(ScanRecord::new(
         scan_id,
@@ -333,7 +491,7 @@ pub async fn start_scan(
                 .and_then(Result::ok)
                 .unwrap_or_default()
         };
-        let probes = Arc::new(NetEnricher::new(&adapters));
+        let probes = Arc::new(NetEnricher::new(&adapters, banners));
         let summary = run_scan(backend, probes, targets, config, cancel, scan_id, on_batch).await;
         let state = app.state::<AppState>();
         if let Some(record) = state.last_scan().as_mut().filter(|r| r.scan_id == scan_id) {
@@ -364,12 +522,120 @@ pub async fn start_scan(
                 eprintln!("saving known devices failed");
             }
         }
+        // Port scan of the hosts that answered, unless the scan was stopped.
+        let stopped = *port_cancel.borrow();
+        let ports_finished = match port_plan {
+            Some(plan) if !stopped => {
+                let targets = state.port_targets(scan_id);
+                Some(run_ports(&app, scan_id, targets, plan, banners, port_cancel).await)
+            }
+            _ => None,
+        };
         // Free the slot first, so the frontend can start a new scan right after the event.
         state.end_scan(scan_id);
+        if let Some(finished) = ports_finished {
+            let _ = app.emit(EVENT_PORTS_FINISHED, &finished);
+        }
         let _ = app.emit(EVENT_SCAN_FINISHED, summary);
     });
 
     Ok(ScanStarted { scan_id, total })
+}
+
+/// Runs a port scan, sending `ports:batch` events while it runs, and returns the
+/// `ports:finished` payload for the caller to send once the scan slot is free.
+async fn run_ports(
+    app: &AppHandle,
+    scan_id: u64,
+    targets: Vec<PortTarget>,
+    plan: PortPlan,
+    banners: bool,
+    cancel: watch::Receiver<bool>,
+) -> PortsFinished {
+    let emitter = app.clone();
+    let selection = plan.selection.clone();
+    let set = Arc::clone(&plan.set);
+    let on_batch = move |batch: PortBatch| {
+        let hosts = emitter
+            .state::<AppState>()
+            .record_ports(&selection, &set, batch.hosts);
+        let event = PortsBatch {
+            scan_id: batch.scan_id,
+            hosts,
+            done: batch.done,
+            total: batch.total,
+        };
+        let _ = emitter.emit(EVENT_PORTS_BATCH, &event);
+    };
+    let prober = Arc::new(TcpProber { banners });
+    let result = scan_ports(
+        prober,
+        targets,
+        plan.set,
+        plan.config,
+        cancel,
+        scan_id,
+        on_batch,
+    )
+    .await;
+    match result {
+        Ok(summary) => PortsFinished {
+            scan_id,
+            summary: Some(summary),
+            error: None,
+        },
+        Err(e) => PortsFinished {
+            scan_id,
+            summary: None,
+            error: Some(e.into()),
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostPortsRequest {
+    ip: IpAddr,
+    ports: PortScanOptions,
+    /// Read banners and HTTP titles of open ports (default: on).
+    banners: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortScanStarted {
+    scan_id: u64,
+    /// Probes to make.
+    total: u64,
+}
+
+/// "Scan ports…" for one host of the last scan, in the background. Results arrive as
+/// `ports:batch` events, the end as one `ports:finished` event. It takes the scan slot:
+/// `stop_scan` stops it and no other scan can start meanwhile.
+#[tauri::command]
+pub async fn scan_host_ports(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: HostPortsRequest,
+) -> Result<PortScanStarted, CommandError> {
+    let plan = request.ports.plan()?;
+    if !state.has_host(request.ip) {
+        return Err(CommandError::new(
+            "ports.unknown_host",
+            "this address is not part of the scan results",
+        ));
+    }
+    let total = check_probes(1, plan.set.len(), plan.config.max_probes)?;
+    let (scan_id, cancel) = state.begin_scan()?;
+    let banners = request.banners.unwrap_or(true);
+    // A fresh scan: nothing is taken over from host discovery.
+    let target = PortTarget::from(request.ip);
+    tauri::async_runtime::spawn(async move {
+        let finished = run_ports(&app, scan_id, vec![target], plan, banners, cancel).await;
+        app.state::<AppState>().end_scan(scan_id);
+        let _ = app.emit(EVENT_PORTS_FINISHED, &finished);
+    });
+    Ok(PortScanStarted { scan_id, total })
 }
 
 #[tauri::command]
@@ -860,7 +1126,134 @@ mod tests {
             concurrency,
             timeout_ms,
             offline_names: None,
+            banners: None,
+            ports: None,
         }
+    }
+
+    fn options(json: &str) -> Result<PortPlan, CommandError> {
+        serde_json::from_str::<PortScanOptions>(json)
+            .map_err(|e| CommandError::new("json", e.to_string()))?
+            .plan()
+    }
+
+    #[test]
+    fn port_scan_options() {
+        let plan = options(r#"{"selection":{"preset":"top100"}}"#).unwrap();
+        assert_eq!(plan.set.len(), 100);
+        assert_eq!(plan.config, PortScanConfig::default());
+
+        let plan = options(
+            r#"{"selection":{"custom":"443, 22,80"},"timeoutMs":500,"concurrency":64,"perHost":8,"maxProbes":5000}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.selection, PortSelection::Custom("22,80,443".into()));
+        assert_eq!(plan.config.timeout, Duration::from_millis(500));
+        assert_eq!((plan.config.concurrency, plan.config.per_host), (64, 8));
+        assert_eq!(plan.config.max_probes, 5000);
+
+        let code = |json: &str| options(json).unwrap_err().code;
+        assert_eq!(
+            code(r#"{"selection":{"custom":"22,"}}"#),
+            "ports.empty_entry"
+        );
+        assert_eq!(
+            code(r#"{"selection":{"custom":"0"}}"#),
+            "ports.out_of_range"
+        );
+        assert_eq!(
+            code(r#"{"selection":{"preset":"common"},"timeoutMs":50}"#),
+            "ports.invalid_timeout"
+        );
+        assert_eq!(
+            code(r#"{"selection":{"preset":"common"},"concurrency":5000}"#),
+            "ports.invalid_concurrency"
+        );
+        assert_eq!(
+            code(r#"{"selection":{"preset":"common"},"maxProbes":0}"#),
+            "ports.invalid_max_probes"
+        );
+        // Unknown fields and presets are rejected by the parser.
+        assert_eq!(code(r#"{"selection":{"preset":"common"},"x":1}"#), "json");
+        assert_eq!(code(r#"{"selection":{"preset":"top5"}}"#), "json");
+        assert_eq!(code(r#"{}"#), "json");
+    }
+
+    #[test]
+    fn scan_request_with_port_scan() {
+        let request: ScanRequest = serde_json::from_str(
+            r#"{"targets":"10.0.0.0/24","banners":false,"ports":{"selection":{"preset":"common"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(request.banners, Some(false));
+        assert!(request.ports.is_some());
+        let request: HostPortsRequest =
+            serde_json::from_str(r#"{"ip":"10.0.0.5","ports":{"selection":{"custom":"22"}}}"#)
+                .unwrap();
+        assert_eq!(request.ip, ip(5));
+        assert_eq!(request.banners, None);
+        let bad: Result<HostPortsRequest, _> = serde_json::from_str(
+            r#"{"ip":"10.0.0.5","ports":{"selection":{"custom":"22"}},"cmd":"x"}"#,
+        );
+        assert!(bad.is_err());
+    }
+
+    fn online(d: u8, probed: Vec<(u16, crate::ports::PortState)>) -> HostResult {
+        let mut host = HostResult::new(ip(d));
+        host.online = true;
+        host.probed_ports = probed;
+        host.mark_live();
+        host
+    }
+
+    #[test]
+    fn port_targets_are_the_hosts_that_answered() {
+        use crate::ports::PortState::{Closed, Filtered, Open};
+        use crate::ports::scanner::Probe;
+        let mut record = record(&[3]);
+        record.add(online(9, vec![(22, Open), (80, Closed), (443, Filtered)]));
+        record.add(online(5, Vec::new()));
+        let targets = record.port_targets();
+        let ips: Vec<IpAddr> = targets.iter().map(|t| t.ip).collect();
+        assert_eq!(ips, [ip(5), ip(9)]);
+        assert_eq!(targets[1].known, [(22, Probe::OPEN), (80, Probe::Closed)]);
+    }
+
+    #[test]
+    fn port_results_are_shown_and_exported_on_top_of_the_scan() {
+        use crate::ports::PortState;
+        use crate::ports::scanner::PortEntry;
+        let mut record = record(&[]);
+        record.add(online(5, Vec::new()));
+        let known = KnownDevices::default();
+        let selection = PortSelection::Custom("22".into());
+        let set = Arc::new(PortSet::parse("22").unwrap());
+        let report = |ip: IpAddr| HostPorts {
+            ip,
+            complete: true,
+            probed: 1,
+            total: 1,
+            ports: vec![PortEntry {
+                port: 22,
+                state: PortState::Open,
+                service: Some("ssh"),
+                banner: Some("SSH-2.0-test".into()),
+                http: None,
+            }],
+            open: 1,
+            closed: 0,
+            filtered: 0,
+            errors: 0,
+        };
+        // Hosts that are not part of the scan are ignored.
+        let shown = record.add_ports(&selection, &set, vec![report(ip(5)), report(ip(6))], &known);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].services[0].banner.as_deref(), Some("SSH-2.0-test"));
+        assert!(shown[0].port_scan.as_ref().unwrap().complete);
+        // The scan's own data stays untouched; exports see the port results.
+        assert!(record.hosts[&ip(5)].services.is_empty());
+        let exported = record.select(None, &known);
+        assert_eq!(exported[0].services.len(), 1);
     }
 
     #[test]
