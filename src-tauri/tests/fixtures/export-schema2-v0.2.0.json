@@ -1,0 +1,145 @@
+{
+  "schema_version": 2,
+  "generator": {
+    "name": "Ironsight",
+    "version": "0.2.0"
+  },
+  "exported_at": "2025-11-14T18:35:00Z",
+  "scope": "all",
+  "scan": {
+    "targets": "192.168.1.0/24",
+    "started_at": "2025-11-14T18:30:00Z",
+    "finished_at": "2025-11-14T18:30:12Z",
+    "cancelled": false,
+    "total": 254,
+    "scanned": 254,
+    "online": 1,
+    "errors": 0,
+    "concurrency": 64,
+    "timeout_ms": 1000
+  },
+  "hosts": [
+    {
+      "ip": "192.168.1.1",
+      "online": true,
+      "status": "online",
+      "last_seen": "2025-11-14T18:30:00Z",
+      "sources": {
+        "hostname": "live",
+        "mac": "live",
+        "vendor": "live",
+        "services": "live",
+        "workgroup": null
+      },
+      "hostname": "fritz.box",
+      "hostname_source": "dns",
+      "names": {
+        "dns": "fritz.box",
+        "mdns": null,
+        "netbios": "FRITZ"
+      },
+      "mac": "00:00:0C:12:34:56",
+      "mac_locally_administered": false,
+      "vendor": "Cisco Systems, Inc",
+      "rtt_ms": 2,
+      "workgroup": null,
+      "seen_by": {
+        "arp": true,
+        "icmp": true,
+        "tcp": true
+      },
+      "services": [
+        {
+          "port": 80,
+          "name": "http",
+          "http": {
+            "status": 200,
+            "server": "nginx",
+            "title": "=cmd|' /C calc'!A0 \"<b>"
+          }
+        },
+        {
+          "port": 443,
+          "name": "https",
+          "http": null
+        }
+      ],
+      "last_update": "2025-11-14T18:30:00Z"
+    },
+    {
+      "ip": "192.168.1.20",
+      "online": true,
+      "status": "online",
+      "last_seen": "2025-11-14T18:30:01Z",
+      "sources": {
+        "hostname": "live",
+        "mac": "live",
+        "vendor": "live",
+        "services": "live",
+        "workgroup": "live"
+      },
+      "hostname": "NAS",
+      "hostname_source": "netbios",
+      "names": {
+        "dns": null,
+        "mdns": null,
+        "netbios": "NAS"
+      },
+      "mac": "00:11:32:AA:BB:CC",
+      "mac_locally_administered": false,
+      "vendor": "Synology Incorporated",
+      "rtt_ms": 1,
+      "workgroup": "WORKGROUP",
+      "seen_by": {
+        "arp": false,
+        "icmp": true,
+        "tcp": false
+      },
+      "services": [
+        {
+          "port": 22,
+          "name": "ssh",
+          "http": null
+        },
+        {
+          "port": 445,
+          "name": "smb",
+          "http": null
+        }
+      ],
+      "last_update": "2025-11-14T18:30:01Z"
+    },
+    {
+      "ip": "192.168.1.2",
+      "online": false,
+      "status": "unused",
+      "last_seen": null,
+      "sources": {
+        "hostname": null,
+        "mac": null,
+        "vendor": null,
+        "services": null,
+        "workgroup": null
+      },
+      "hostname": null,
+      "hostname_source": null,
+      "names": {
+        "dns": null,
+        "mdns": null,
+        "netbios": null
+      },
+      "mac": null,
+      "mac_locally_administered": false,
+      "vendor": null,
+      "rtt_ms": null,
+      "workgroup": null,
+      "seen_by": {
+        "arp": false,
+        "icmp": false,
+        "tcp": false
+      },
+      "services": [],
+      "last_update": "2025-11-14T18:30:00Z"
+    }
+  ]
+}

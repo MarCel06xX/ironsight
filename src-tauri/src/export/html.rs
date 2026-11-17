@@ -5,7 +5,11 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use super::labels::Labels;
-use super::{ExportOptions, ScanInfo, Scope, source_key, sources_text, status_key, time, web_info};
+use super::{
+    ExportOptions, PortStepInfo, ScanInfo, Scope, port_rows, selection_text, source_key,
+    sources_text, state_key, status_key, time, web_info,
+};
+use crate::ports::PortState;
 use crate::scan::{HostResult, HostStatus, NameSource};
 
 const STYLE: &str = r#"
@@ -29,6 +33,18 @@ table { border-collapse: collapse; }
 .hosts tr.unused td { color: #a0a7b3; }
 .dot { display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: #a0a7b3; }
 .dot.on { background: #1f9d55; }
+h2 { margin: 24px 0 10px; font-size: 16px; }
+.host-ports { margin: 0 0 16px; break-inside: avoid; }
+.host-ports h3 { margin: 0 0 2px; font-size: 13px; }
+.ports-table { width: 100%; max-width: 960px; margin-top: 4px; table-layout: fixed; }
+.ports-table th:nth-child(1) { width: 64px; }
+.ports-table th:nth-child(2) { width: 130px; }
+.ports-table th:nth-child(3) { width: 100px; }
+.ports-table th, .ports-table td { padding: 3px 10px 3px 0; border-bottom: 1px solid #d5d9e0; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.ports-table th { font-weight: 600; color: #5d6675; }
+.state-open { color: #15803d; font-weight: 600; }
+.state-closed { color: #5d6675; }
+.state-filtered { color: #5d6675; font-style: italic; }
 footer { margin-top: 20px; font-size: 11px; }
 @page { size: A4 landscape; margin: 12mm; }
 @media print {
@@ -142,6 +158,14 @@ pub fn write_html(
         ));
     }
     meta_row(&mut html, labels.get("export.result"), &result, "");
+    if let Some(step) = &info.port_scan {
+        meta_row(
+            &mut html,
+            labels.get("export.portScan"),
+            &port_step_text(step, labels),
+            "",
+        );
+    }
     let rows_key = match options.scope {
         Scope::All => "export.rowsAll",
         Scope::View => "export.rowsView",
@@ -172,12 +196,157 @@ pub fn write_html(
     }
     html.push_str("</tbody></table>\n");
 
+    // One block per host with known ports: open ports with banners, listed closed/filtered.
+    let with_ports: Vec<&HostResult> = hosts
+        .iter()
+        .filter(|host| host.port_scan.is_some() || !host.services.is_empty())
+        .collect();
+    if !with_ports.is_empty() {
+        let _ = writeln!(
+            html,
+            "<section class=\"ports\"><h2>{}</h2>",
+            escape(labels.get("details.ports"))
+        );
+        for host in with_ports {
+            host_ports(&mut html, host, labels);
+        }
+        html.push_str("</section>\n");
+    }
+
     let _ = write!(
         html,
         "<footer>{}</footer>\n</body>\n</html>\n",
         escape(labels.get("export.legal"))
     );
     out.write_all(html.as_bytes())
+}
+
+/// `Top 100 – 1,347 of 1,347 checks · banners read`
+fn port_step_text(step: &PortStepInfo, labels: &Labels) -> String {
+    let selection = selection_text(&step.selection, labels);
+    let mut text = match (step.error, step.checks) {
+        (Some(_), _) => labels.fill("export.portStepRefused", &[("selection", &selection)]),
+        (None, None) => labels.fill("export.portStepSkipped", &[("selection", &selection)]),
+        (None, Some((done, total))) => labels.fill(
+            "export.portStepDone",
+            &[
+                ("selection", &selection),
+                ("done", &labels.count(done)),
+                ("total", &labels.count(total)),
+            ],
+        ),
+    };
+    if step.cancelled {
+        text.push(' ');
+        text.push_str(labels.get("export.portScanStopped"));
+    }
+    text.push_str(" · ");
+    text.push_str(labels.get(match step.banners {
+        true => "export.portStepBanners",
+        false => "export.portStepNoBanners",
+    }));
+    text
+}
+
+fn state_class(state: PortState) -> &'static str {
+    match state {
+        PortState::Open => "state-open",
+        PortState::Closed => "state-closed",
+        PortState::Filtered => "state-filtered",
+    }
+}
+
+/// Ports block of one host (see [`port_rows`]); every value is escaped.
+fn host_ports(html: &mut String, host: &HostResult, labels: &Labels) {
+    let _ = write!(
+        html,
+        "<div class=\"host-ports\"><h3><span class=\"mono\">{}</span>",
+        host.ip
+    );
+    if let Some(name) = &host.hostname {
+        let _ = write!(html, " – {}", escape(name));
+    }
+    html.push_str("</h3>");
+    let count = |n: u32| labels.count(u64::from(n));
+    match &host.port_scan {
+        Some(scan) => {
+            let selection = selection_text(&scan.selection, labels);
+            small(
+                html,
+                &labels.fill("details.portScan", &[("selection", &selection)]),
+            );
+            small(
+                html,
+                &labels.fill(
+                    "details.portScanCounts",
+                    &[
+                        ("probed", &count(scan.probed)),
+                        ("total", &count(scan.total)),
+                        ("open", &count(scan.open)),
+                        ("closed", &count(scan.closed)),
+                        ("filtered", &count(scan.filtered)),
+                    ],
+                ),
+            );
+            if !scan.complete {
+                small(html, labels.get("details.portScanIncomplete"));
+            }
+            if scan.errors > 0 {
+                small(
+                    html,
+                    &labels.fill("details.portScanErrors", &[("errors", &count(scan.errors))]),
+                );
+            }
+        }
+        None => small(html, labels.get("details.discoveryPorts")),
+    }
+
+    let rows = port_rows(host);
+    if rows.is_empty() {
+        small(html, labels.get("details.noOpenPorts"));
+    } else {
+        html.push_str("<table class=\"ports-table\"><thead><tr>");
+        for key in [
+            "ports.colPort",
+            "ports.colService",
+            "ports.colState",
+            "ports.colBanner",
+        ] {
+            let _ = write!(html, "<th>{}</th>", escape(labels.get(key)));
+        }
+        html.push_str("</tr></thead><tbody>");
+        for row in &rows {
+            let name = if row.name == "unknown" { "" } else { row.name };
+            let _ = write!(
+                html,
+                "<tr><td class=\"mono\">{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td></tr>",
+                row.port,
+                escape(name),
+                state_class(row.state),
+                escape(labels.get(state_key(row.state))),
+                escape(&row.banner)
+            );
+        }
+        html.push_str("</tbody></table>");
+    }
+    if let Some(scan) = &host.port_scan {
+        let shown = |state: PortState| rows.iter().filter(|row| row.state == state).count() as u32;
+        for (total, state, key) in [
+            (scan.open, PortState::Open, "details.moreOpen"),
+            (scan.closed, PortState::Closed, "details.closedNotListed"),
+            (
+                scan.filtered,
+                PortState::Filtered,
+                "details.filteredNotListed",
+            ),
+        ] {
+            let hidden = total.saturating_sub(shown(state));
+            if hidden > 0 {
+                small(html, &labels.fill(key, &[("count", &count(hidden))]));
+            }
+        }
+    }
+    html.push_str("</div>\n");
 }
 
 fn host_row(html: &mut String, host: &HostResult, labels: &Labels, offset: i32) {
@@ -323,6 +492,60 @@ mod tests {
         assert!(html.contains("<div>80 http</div>"));
         assert!(!html.contains("<script"));
         assert!(html.trim_end().ends_with("</html>"));
+
+        // Port scan metadata and the ports block of the router.
+        assert!(
+            html.contains(
+                "<th>Port scan</th><td class=\"\">Top 100 – 97 of 97 checks · banners read</td>"
+            ),
+            "{html}"
+        );
+        assert_eq!(html.matches("<div class=\"host-ports\">").count(), 1);
+        assert!(html.contains("<h3><span class=\"mono\">192.168.1.1</span> – fritz.box</h3>"));
+        assert!(html.contains("100 of 100 checked – 3 open, 95 closed, 2 filtered"));
+        assert!(html.contains(
+            "<tr><td class=\"mono\">8000</td><td>http-alt</td><td class=\"state-filtered\">filtered</td><td></td></tr>"
+        ));
+        assert!(html.contains("95 closed ports not listed."));
+        // The hostile banner is text.
+        assert!(html.contains(
+            "SSH-2.0-x =HYPERLINK(&quot;http://evil&quot;) &lt;img src=x onerror=alert(1)&gt;"
+        ));
+        assert!(!html.contains("<img"));
+    }
+
+    /// Manual look at the layout:
+    /// `REPORT_OUT=<file>.html cargo test write_sample_report -- --ignored`
+    #[test]
+    #[ignore = "writes a sample report"]
+    fn write_sample_report() {
+        let hosts = crate::export::tests::fixture_hosts();
+        let language = match std::env::var("REPORT_LANG").as_deref() {
+            Ok("de") => ReportLanguage::De,
+            _ => ReportLanguage::En,
+        };
+        std::fs::write(
+            std::env::var("REPORT_OUT").unwrap(),
+            report(language, &hosts),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn port_step_texts() {
+        let labels = Labels::new(ReportLanguage::En);
+        let mut step = sample_info().port_scan.unwrap();
+        step.cancelled = true;
+        step.banners = false;
+        assert_eq!(
+            port_step_text(&step, &labels),
+            "Top 100 – 97 of 97 checks (stopped) · without banners"
+        );
+        step.checks = None;
+        step.cancelled = false;
+        assert!(port_step_text(&step, &labels).starts_with("Top 100 – not run"));
+        step.error = Some("ports.too_many_probes");
+        assert!(port_step_text(&step, &labels).starts_with("Top 100 – refused"));
     }
 
     #[test]

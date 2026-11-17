@@ -6,8 +6,10 @@ use std::io::{self, Write};
 
 use super::labels::Labels;
 use super::{
-    Delimiter, seen_by_text, services_text, source_key, sources_text, status_key, time, web_info,
+    Delimiter, port_rows, port_scan_text, seen_by_text, services_text, source_key, sources_text,
+    state_key, status_key, time, web_info,
 };
+use crate::ports::PortState;
 use crate::scan::HostResult;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -97,6 +99,11 @@ pub fn write_csv(
         "details.lastSeen",
         "col.lastSeen",
         "export.col.source",
+        "export.col.portScan",
+        "export.col.closedPorts",
+        "export.col.filteredPorts",
+        "export.col.listedPorts",
+        "export.col.banners",
     ]
     .map(|key| trusted(labels.get(key)));
     write_row(out, &header, delimiter)?;
@@ -108,6 +115,32 @@ pub fn write_csv(
             (Some(_), true) => labels.get("export.yes"),
             (Some(_), false) => labels.get("export.no"),
         };
+        let scan = host.port_scan.as_ref();
+        let count = |get: fn(&crate::scan::PortScanInfo) -> u32| {
+            scan.map(|scan| get(scan).to_string()).unwrap_or_default()
+        };
+        let rows = port_rows(host);
+        // `23 telnet: closed, 8000 http-alt: filtered`
+        let listed = rows
+            .iter()
+            .filter(|row| row.state != PortState::Open)
+            .map(|row| {
+                format!(
+                    "{} {}: {}",
+                    row.port,
+                    row.name,
+                    labels.get(state_key(row.state))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // One line per open port that said something: `22 ssh: SSH-2.0-OpenSSH_9.6`
+        let banners = rows
+            .iter()
+            .filter(|row| !row.banner.is_empty())
+            .map(|row| format!("{} {}: {}", row.port, row.name, row.banner))
+            .collect::<Vec<_>>()
+            .join("\n");
         let row = [
             trusted(labels.get(status_key(host))),
             trusted(host.ip.to_string()),
@@ -135,6 +168,11 @@ pub fn write_csv(
                     .unwrap_or_default(),
             ),
             trusted(sources_text(host, labels)),
+            trusted(scan.map(|s| port_scan_text(s, labels)).unwrap_or_default()),
+            trusted(count(|s| s.closed)),
+            trusted(count(|s| s.filtered)),
+            trusted(listed),
+            untrusted(Some(banners.as_str())),
         ];
         write_row(out, &row, delimiter)?;
     }
@@ -194,13 +232,20 @@ mod tests {
         );
         assert_eq!(lines[3], "");
         assert!(lines[0].starts_with("Status;IP address;Hostname;Hostname source;"));
-        assert_eq!(lines[0].split(';').count(), 19);
-        assert!(lines[0].ends_with(";Last seen;Data source"), "{}", lines[0]);
+        assert_eq!(lines[0].split(';').count(), 24);
+        assert!(
+            lines[0].ends_with(
+                ";Last seen;Data source;Port scan;Closed ports;Filtered ports;\
+                 Listed closed/filtered ports;Banners"
+            ),
+            "{}",
+            lines[0]
+        );
 
         let router = lines[1];
         assert!(router.starts_with("Online;192.168.1.1;fritz.box;DNS;fritz.box;;FRITZ;"));
         assert!(router.contains(";no;"), "{router}");
-        assert!(router.contains(";80 http, 443 https;"), "{router}");
+        assert!(router.contains(";22 ssh, 80 http, 443 https;"), "{router}");
         assert!(
             router.contains(";2025-11-14T19:30:00+01:00;2025-11-14T19:30:00+01:00;live"),
             "{router}"
@@ -210,11 +255,41 @@ mod tests {
             router.contains(";\"'=cmd|' /C calc'!A0 \"\"<b>\";"),
             "{router}"
         );
+        // Port scan columns; banners one per line in one quoted cell, quotes doubled.
+        assert!(
+            router.contains(
+                ";live;Top 100 – 100 of 100 checked;95;2;\
+                 8000 http-alt: filtered, 8443 https-alt: filtered;\
+                 \"22 ssh: SSH-2.0-x =HYPERLINK(\"\"http://evil\"\") <img src=x onerror=alert(1)>\n\
+                 80 http: HTTP 200 · nginx · =cmd|' /C calc'!A0 \"\"<b>\""
+            ),
+            "{router}"
+        );
+        assert!(router.ends_with('"'), "{router}");
 
         assert!(
             lines[2].starts_with("Unused;192.168.1.2;;;;;;;;;;;;;;;"),
             "{}",
             lines[2]
+        );
+        // No port scan: the port columns stay empty.
+        assert!(lines[2].ends_with(";;;;;;"), "{}", lines[2]);
+    }
+
+    #[test]
+    fn banners_with_delimiters_and_formulas_stay_one_cell() {
+        let mut hosts = sample_hosts();
+        hosts[0].services[0].banner = Some("=1+1; a,b \"c\"".into());
+        hosts[0].services.truncate(1);
+        let mut out = Vec::new();
+        let labels = Labels::new(ReportLanguage::En);
+        write_csv(&mut out, &hosts, Delimiter::Semicolon, &labels, 0).unwrap();
+        let text = utf8(&out[BOM.len()..]);
+        let router = text.split("\r\n").nth(1).unwrap();
+        // Starts with the port number, so no formula; quoted for the delimiter and quotes.
+        assert!(
+            router.ends_with(";\"22 ssh: =1+1; a,b \"\"c\"\"\""),
+            "{router}"
         );
     }
 
@@ -225,7 +300,11 @@ mod tests {
         write_csv(&mut out, &sample_hosts(), Delimiter::Comma, &labels, 0).unwrap();
         let text = utf8(&out[BOM.len()..]);
         assert!(text.starts_with("Status,IP-Adresse,Hostname,"));
-        assert!(text.contains(",\"80 http, 443 https\","), "{text}");
+        assert!(text.contains(",\"22 ssh, 80 http, 443 https\","), "{text}");
+        assert!(
+            text.contains(",Top 100 – 100 von 100 geprüft,95,2,"),
+            "{text}"
+        );
         assert!(text.contains(",nein,"), "{text}");
     }
 }

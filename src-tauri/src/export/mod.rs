@@ -5,7 +5,9 @@ use std::io::{self, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::scan::{DataSource, HostResult, HostStatus, NameSource};
+use crate::ports::presets::PortPreset;
+use crate::ports::{PortSelection, PortState};
+use crate::scan::{DataSource, HostResult, HostStatus, NameSource, PortScanInfo, ServiceInfo};
 
 mod csv;
 mod html;
@@ -93,6 +95,23 @@ pub struct ScanInfo {
     pub errors: u32,
     pub concurrency: u32,
     pub timeout_ms: u32,
+    /// Port scan step after host discovery, if one was requested.
+    pub port_scan: Option<PortStepInfo>,
+}
+
+/// Port scan step of a network scan, for the export metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortStepInfo {
+    pub selection: PortSelection,
+    pub timeout_ms: u32,
+    pub concurrency: u32,
+    pub max_probes: u64,
+    pub banners: bool,
+    /// Checks made and planned; `None` while running or if the step did not run.
+    pub checks: Option<(u64, u64)>,
+    pub cancelled: bool,
+    /// Error code if the step was refused (e.g. `ports.too_many_probes`).
+    pub error: Option<&'static str>,
 }
 
 pub fn write_export(
@@ -179,6 +198,98 @@ fn services_text(host: &HostResult) -> String {
         .join(", ")
 }
 
+fn preset_key(preset: PortPreset) -> &'static str {
+    match preset {
+        PortPreset::Common => "ports.preset.common",
+        PortPreset::Top100 => "ports.preset.top100",
+        PortPreset::Top1000 => "ports.preset.top1000",
+        PortPreset::All => "ports.preset.all",
+    }
+}
+
+/// `Top 100`, `Custom (22,80,443)`
+fn selection_text(selection: &PortSelection, labels: &Labels) -> String {
+    match selection {
+        PortSelection::Preset(preset) => labels.get(preset_key(*preset)).to_owned(),
+        PortSelection::Custom(list) => labels.fill("ports.customLabel", &[("list", list)]),
+    }
+}
+
+fn state_key(state: PortState) -> &'static str {
+    match state {
+        PortState::Open => "ports.state.open",
+        PortState::Closed => "ports.state.closed",
+        PortState::Filtered => "ports.state.filtered",
+    }
+}
+
+/// What a service said about itself: its banner, otherwise `HTTP 200 · nginx · Title`.
+fn banner_text(service: &ServiceInfo) -> String {
+    if let Some(banner) = &service.banner {
+        return banner.clone();
+    }
+    let Some(http) = &service.http else {
+        return String::new();
+    };
+    let status = http.status.map(|code| format!("HTTP {code}"));
+    [
+        status.as_deref(),
+        http.server.as_deref(),
+        http.title.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+/// A port as listed in the reports.
+struct PortRow {
+    port: u16,
+    name: &'static str,
+    state: PortState,
+    /// Untrusted text from the service (open ports only).
+    banner: String,
+}
+
+/// Open ports with their banners, plus the closed/filtered ports a port scan listed.
+fn port_rows(host: &HostResult) -> Vec<PortRow> {
+    let open = host.services.iter().map(|service| PortRow {
+        port: service.port,
+        name: service.name,
+        state: PortState::Open,
+        banner: banner_text(service),
+    });
+    let listed = host.port_scan.iter().flat_map(|scan| &scan.listed);
+    let mut rows: Vec<PortRow> = open
+        .chain(listed.map(|listed| PortRow {
+            port: listed.port,
+            name: listed.name,
+            state: listed.state,
+            banner: String::new(),
+        }))
+        .collect();
+    rows.sort_by_key(|row| row.port);
+    rows
+}
+
+/// `Top 100 – 100 of 100 checked`, plus `(stopped)` for an unfinished scan.
+fn port_scan_text(scan: &PortScanInfo, labels: &Labels) -> String {
+    let mut text = labels.fill(
+        "export.portScanChecked",
+        &[
+            ("selection", &selection_text(&scan.selection, labels)),
+            ("probed", &labels.count(u64::from(scan.probed))),
+            ("total", &labels.count(u64::from(scan.total))),
+        ],
+    );
+    if !scan.complete {
+        text.push(' ');
+        text.push_str(labels.get("export.portScanStopped"));
+    }
+    text
+}
+
 /// `ARP, ICMP, TCP`
 fn seen_by_text(host: &HostResult, labels: &Labels) -> String {
     [
@@ -207,7 +318,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::mac::MacAddr;
-    use crate::scan::{HttpInfo, SeenBy, ServiceInfo};
+    use crate::scan::{HttpInfo, ListedPort, SeenBy};
 
     pub(crate) const STARTED: u64 = 1_763_145_000_000; // 2025-11-14T18:30:00Z
 
@@ -227,6 +338,16 @@ pub(crate) mod tests {
             errors: 0,
             concurrency: 64,
             timeout_ms: 1000,
+            port_scan: Some(PortStepInfo {
+                selection: PortSelection::Preset(PortPreset::Top100),
+                timeout_ms: 800,
+                concurrency: 256,
+                max_probes: 1_000_000,
+                banners: true,
+                checks: Some((97, 97)),
+                cancelled: false,
+                error: None,
+            }),
         }
     }
 
@@ -241,7 +362,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// An enriched router (with a hostile page title) and an offline address.
+    /// An enriched, port-scanned router (with a hostile page title and banner) and an
+    /// offline address.
     pub(crate) fn sample_hosts() -> Vec<HostResult> {
         let mut router = HostResult::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
         router.online = true;
@@ -262,7 +384,32 @@ pub(crate) mod tests {
             server: Some("nginx".into()),
             title: Some("=cmd|' /C calc'!A0 \"<b>".into()),
         });
-        router.services = vec![http, ServiceInfo::open(443)];
+        let mut ssh = ServiceInfo::open(22);
+        ssh.banner =
+            Some("SSH-2.0-x =HYPERLINK(\"http://evil\") <img src=x onerror=alert(1)>".into());
+        router.services = vec![ssh, http, ServiceInfo::open(443)];
+        router.port_scan = Some(PortScanInfo {
+            selection: PortSelection::Preset(PortPreset::Top100),
+            complete: true,
+            probed: 100,
+            total: 100,
+            open: 3,
+            closed: 95,
+            filtered: 2,
+            errors: 0,
+            listed: vec![
+                ListedPort {
+                    port: 8000,
+                    state: PortState::Filtered,
+                    name: "http-alt",
+                },
+                ListedPort {
+                    port: 8443,
+                    state: PortState::Filtered,
+                    name: "https-alt",
+                },
+            ],
+        });
         router.timestamp_ms = STARTED;
         router.mark_live();
 
@@ -271,6 +418,75 @@ pub(crate) mod tests {
         offline.timestamp_ms = STARTED;
         offline.update_status();
         vec![router, offline]
+    }
+
+    /// [`sample_hosts`] plus a NAS - the hosts the fixtures in `tests/fixtures` were written
+    /// from (by each version's own code).
+    pub(crate) fn fixture_hosts() -> Vec<HostResult> {
+        let mut hosts = sample_hosts();
+        let mut nas = HostResult::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)));
+        nas.online = true;
+        nas.complete = true;
+        nas.seen_by.icmp = true;
+        nas.rtt_ms = Some(1);
+        nas.set_mac(MacAddr([0x00, 0x11, 0x32, 0xaa, 0xbb, 0xcc]));
+        nas.names.netbios = Some("NAS".into());
+        nas.workgroup = Some("WORKGROUP".into());
+        nas.pick_hostname();
+        nas.services = vec![ServiceInfo::open(22), ServiceInfo::open(445)];
+        nas.timestamp_ms = STARTED + 1000;
+        nas.mark_live();
+        hosts.insert(1, nas);
+        hosts
+    }
+
+    /// Writes the fixture of the current schema:
+    /// `FIXTURE_OUT=tests/fixtures/export-schema3-v0.4.0.json cargo test write_fixture -- --ignored`
+    #[test]
+    #[ignore = "writes a fixture"]
+    fn write_fixture() {
+        let mut out = Vec::new();
+        let options = sample_options(ExportKind::Json, Delimiter::Semicolon);
+        write_export(&mut out, &sample_info(), &fixture_hosts(), &options).unwrap();
+        std::fs::write(std::env::var("FIXTURE_OUT").unwrap(), out).unwrap();
+    }
+
+    #[test]
+    fn port_rows_merge_open_and_listed_ports() {
+        let hosts = sample_hosts();
+        let rows = port_rows(&hosts[0]);
+        let ports: Vec<(u16, PortState)> = rows.iter().map(|r| (r.port, r.state)).collect();
+        assert_eq!(
+            ports,
+            [
+                (22, PortState::Open),
+                (80, PortState::Open),
+                (443, PortState::Open),
+                (8000, PortState::Filtered),
+                (8443, PortState::Filtered),
+            ]
+        );
+        assert!(rows[0].banner.starts_with("SSH-2.0-x"));
+        assert_eq!(
+            rows[1].banner,
+            "HTTP 200 · nginx · =cmd|' /C calc'!A0 \"<b>"
+        );
+        assert_eq!(rows[2].banner, "");
+        assert!(port_rows(&hosts[1]).is_empty());
+
+        let labels = Labels::new(ReportLanguage::En);
+        let scan = hosts[0].port_scan.as_ref().unwrap();
+        assert_eq!(
+            port_scan_text(scan, &labels),
+            "Top 100 – 100 of 100 checked"
+        );
+        let mut stopped = scan.clone();
+        stopped.complete = false;
+        stopped.selection = PortSelection::Custom("22,80".into());
+        assert_eq!(
+            port_scan_text(&stopped, &labels),
+            "Custom (22,80) – 100 of 100 checked (stopped)"
+        );
     }
 
     #[test]
@@ -287,7 +503,7 @@ pub(crate) mod tests {
     fn no_untranslated_keys_in_any_format() {
         let prefixes = [
             "export.", "col.", "status.", "source.", "details.", "seenBy.", "rtt.", "vendor.",
-            "origin.",
+            "origin.", "ports.",
         ];
         for language in [ReportLanguage::En, ReportLanguage::De] {
             for kind in [ExportKind::Csv, ExportKind::Json, ExportKind::Html] {
@@ -302,10 +518,24 @@ pub(crate) mod tests {
                 hosts[1].last_seen_ms = Some(STARTED);
                 hosts[1].update_status();
                 hosts[1].rtt_ms = Some(0);
+                // A stopped port scan with a custom list, and a refused port step.
+                if let Some(scan) = hosts[0].port_scan.as_mut() {
+                    scan.selection = PortSelection::Custom("22,80-90".into());
+                    scan.complete = false;
+                }
+                if let Some(step) = info.port_scan.as_mut() {
+                    step.checks = None;
+                    step.error = Some("ports.too_many_probes");
+                }
                 let mut out = Vec::new();
                 write_export(&mut out, &info, &hosts, &options).unwrap();
                 let text = utf8(&out);
                 for prefix in prefixes {
+                    // JSON names a refused port step by its error code on purpose.
+                    let text = match kind {
+                        ExportKind::Json => text.replace("\"ports.too_many_probes\"", ""),
+                        _ => text.clone(),
+                    };
                     assert!(
                         !text.contains(prefix),
                         "{language:?} {kind:?}: raw key {prefix}* in output"
@@ -320,6 +550,13 @@ pub(crate) mod tests {
                     "{count}",
                     "{seconds}",
                     "{ms}",
+                    "{selection}",
+                    "{probed}",
+                    "{open}",
+                    "{closed}",
+                    "{filtered}",
+                    "{list}",
+                    "{done}",
                 ] {
                     assert!(
                         !text.contains(placeholder),

@@ -17,7 +17,8 @@ use crate::actions;
 use crate::enrich::NetEnricher;
 use crate::error::CommandError;
 use crate::export::{
-    self, Delimiter, ExportKind, ExportOptions, Labels, ReportLanguage, ScanInfo, Scope,
+    self, Delimiter, ExportKind, ExportOptions, Labels, PortStepInfo, ReportLanguage, ScanInfo,
+    Scope,
 };
 use crate::known::{self, KnownDevices, LiveSet};
 use crate::mac::MacAddr;
@@ -277,6 +278,20 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Records how the port step of a scan ended, for the export metadata.
+    fn finish_port_step(&self, scan_id: u64, finished: &PortsFinished) {
+        let mut last = self.last_scan();
+        let Some(record) = last.as_mut().filter(|r| r.scan_id == scan_id) else {
+            return;
+        };
+        record.info.finished_at_ms = Some(now_ms());
+        if let Some(step) = record.info.port_scan.as_mut() {
+            step.checks = finished.summary.as_ref().map(|s| (s.done, s.total));
+            step.cancelled = finished.summary.as_ref().is_some_and(|s| s.cancelled);
+            step.error = finished.error.as_ref().map(|e| e.code);
+        }
+    }
+
     fn port_targets(&self, scan_id: u64) -> Vec<PortTarget> {
         self.last_scan()
             .as_ref()
@@ -355,6 +370,22 @@ struct PortPlan {
     selection: PortSelection,
     set: Arc<PortSet>,
     config: PortScanConfig,
+}
+
+impl PortPlan {
+    /// Export metadata of the port step; the results are filled in when it ends.
+    fn step_info(&self, banners: bool) -> PortStepInfo {
+        PortStepInfo {
+            selection: self.selection.clone(),
+            timeout_ms: u32::try_from(self.config.timeout.as_millis()).unwrap_or(u32::MAX),
+            concurrency: u32::try_from(self.config.concurrency).unwrap_or(u32::MAX),
+            max_probes: self.config.max_probes,
+            banners,
+            checks: None,
+            cancelled: false,
+            error: None,
+        }
+    }
 }
 
 impl PortScanOptions {
@@ -471,6 +502,7 @@ pub async fn start_scan(
             errors: 0,
             concurrency: config.concurrency as u32,
             timeout_ms: config.timeout.as_millis() as u32,
+            port_scan: port_plan.as_ref().map(|plan| plan.step_info(banners)),
         },
     ));
 
@@ -531,6 +563,9 @@ pub async fn start_scan(
             }
             _ => None,
         };
+        if let Some(finished) = &ports_finished {
+            state.finish_port_step(scan_id, finished);
+        }
         // Free the slot first, so the frontend can start a new scan right after the event.
         state.end_scan(scan_id);
         if let Some(finished) = ports_finished {
@@ -1026,6 +1061,7 @@ mod tests {
                 errors: 0,
                 concurrency: 64,
                 timeout_ms: 1000,
+                port_scan: None,
             },
         );
         record.hosts = hosts;
@@ -1194,6 +1230,36 @@ mod tests {
         assert_eq!(code(r#"{"selection":{"preset":"common"},"x":1}"#), "json");
         assert_eq!(code(r#"{"selection":{"preset":"top5"}}"#), "json");
         assert_eq!(code(r#"{}"#), "json");
+    }
+
+    #[test]
+    fn port_step_end_is_recorded_for_exports() {
+        let state = AppState::new(default_backend());
+        let mut scan = record(&[]);
+        let plan = options(r#"{"selection":{"preset":"top100"},"timeoutMs":700}"#).unwrap();
+        scan.info.port_scan = Some(plan.step_info(false));
+        *state.last_scan() = Some(scan);
+        let refused = PortsFinished {
+            scan_id: 1,
+            summary: None,
+            error: Some(CommandError::new("ports.too_many_probes", "x")),
+        };
+        state.finish_port_step(2, &refused); // another scan: ignored
+        assert_eq!(
+            state.last_scan().as_ref().unwrap().info.finished_at_ms,
+            Some(1)
+        );
+        state.finish_port_step(1, &refused);
+        let last = state.last_scan();
+        let info = &last.as_ref().unwrap().info;
+        let step = info.port_scan.as_ref().unwrap();
+        assert_eq!(step.timeout_ms, 700);
+        assert!(!step.banners);
+        assert_eq!(
+            (step.checks, step.error),
+            (None, Some("ports.too_many_probes"))
+        );
+        assert!(info.finished_at_ms.unwrap() > 1);
     }
 
     #[test]

@@ -15,9 +15,10 @@ commit + push after each phase, then stop and wait for the user's go.
 - Phase 2 (banners + pipeline) **done**: port step after discovery, `scan_host_ports`,
   `ports:*` events, merged discovery check.
 - Phase 3 (UI) **done**: see "Port scan UI" below.
-- Next: phase 4 export/import (`schema_version` 3, fixtures for 1 and 2; CSV/JSON/HTML get port
-  state, service, banner), phase 5 README/CHANGELOG/version bump (do NOT run
-  `scripts/release.ps1`).
+- Phase 4 (export/import) **done**: JSON schema 3, CSV port columns, HTML ports section,
+  fixtures of every schema in `src-tauri/tests/fixtures/`.
+- Next: phase 5 README/CHANGELOG/version bump to 0.4.0 - then regenerate the schema 3 fixture so
+  its `generator.version` says 0.4.0 (command below); do NOT run `scripts/release.ps1`.
 
 Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), packet
 capture, Linux backend.
@@ -163,11 +164,29 @@ can no longer update.
 - Save dialog: `tauri-plugin-dialog` is registered (needed for the Rust API) but the webview has
   no `dialog:*` permission. Non-blocking `save_file` + oneshot; missing extension is added.
 - `csv.rs`: BOM, CRLF, `;`/`,`, RFC 4180 quoting; network text starting with `= + - @ \t \r`
-  gets a leading `'` (formula injection). Timestamps local RFC 3339 with offset.
-- `json.rs`: own snake_case schema (`schema_version` 1, generator, exported_at, scope, scan
-  metadata, hosts with all names/services); UTC timestamps. Bump the version on breaking changes.
+  gets a leading `'` (formula injection). Timestamps local RFC 3339 with offset. One row per
+  host; port columns appended at the end (existing column order unchanged): Port scan (`Top 100 –
+  100 of 100 checked (stopped)`), Closed ports, Filtered ports (numbers), Listed closed/filtered
+  ports, Banners (untrusted; one `port name: banner` line per open port, LF-separated inside one
+  quoted cell; HTTP ports show `HTTP 200 · server · title`).
+- `json.rs`: own snake_case schema, `SCHEMA_VERSION` 3 (1: v0.1.x, 2: v0.2.0 + status/last_seen/
+  sources, 3: v0.4.0 + `scan.port_scan` {selection, timeout_ms, concurrency, max_probes, banners,
+  checks_done, checks_total, cancelled, error}, `hosts[].port_scan` {selection, complete, probed,
+  total, open, closed, filtered, errors, listed[{port,state,name}]}, `services[].banner`). Open
+  ports stay in `services`. UTC timestamps. Bump the version on breaking changes.
 - `html.rs`: one file, inline CSS, `<meta>` CSP `default-src 'none'`, everything escaped, A4
-  landscape print styles.
+  landscape print styles. Meta row "Port scan" (done/refused/not run, stopped, banners) and a
+  "Ports" section after the host table: one block per host with ports (fixed column widths so
+  the blocks line up). Shared helpers in `export/mod.rs`: `port_rows`, `banner_text`,
+  `selection_text`, `port_scan_text`. `ScanInfo.port_scan: Option<PortStepInfo>` is set at scan
+  start from the plan and completed by `AppState::finish_port_step` (also moves `finished_at`).
+- Fixtures (`src-tauri/tests/fixtures/export-schema{1,2,3}-v*.json`) were written by each
+  version's *own* code (git worktrees of 625ad9b = v0.1.3 and d92461c = v0.2.0 with an injected
+  ignored `write_fixture` test on `sample_hosts` + a NAS). Tests: every fixture imports and works
+  as comparison data (`known.rs`), and the schema 3 fixture equals the current writer's output
+  apart from `generator.version` - change the writer -> regenerate it:
+  `FIXTURE_OUT=tests/fixtures/export-schema3-v0.4.0.json cargo test write_fixture -- --ignored`.
+  Sample HTML report: `REPORT_OUT=<file> [REPORT_LANG=de] cargo test write_sample_report -- --ignored`.
 - `labels.rs`: texts come from `src/locales/*.json` via `include_str!` (one catalog for UI and
   exports); a test renders every format in both languages and fails on raw keys/placeholders.
 - `time.rs`: self-written civil-date conversion (no chrono). Settings now also store
@@ -182,7 +201,7 @@ can no longer update.
   `NetBackend::neighbor_cache` (`GetIpNetTable2`, filtered by `usable_neighbor`) fills MAC/vendor
   of silent addresses at scan end.
 - `known.rs` `KnownDevices`: remembered (session; opt-in file `known-devices.json` in app data
-  dir / `ironsight-known-devices.json` next to the portable exe) + imported (JSON export v1/v2,
+  dir / `ironsight-known-devices.json` next to the portable exe) + imported (JSON export v1-v3,
   untrusted, sanitized). Key MAC, else IP; recording an IP removes it from other devices; a
   device online elsewhere in this scan is not shown at its old IP; a cache MAC only matches that
   MAC. `apply_known` merges known data into silent hosts.

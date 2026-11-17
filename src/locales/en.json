@@ -265,5 +265,18 @@
   "settings.portMaxProbes": "Port check limit",
   "settings.portMaxProbesHint": "Port scans with more checks (devices × ports) are refused (1–16,777,216).",
   "settings.banners": "Read service banners and web page titles",
-  "settings.bannersHint": "Reads what services send by themselves; web servers get one request for the page title."
+  "settings.bannersHint": "Reads what services send by themselves; web servers get one request for the page title.",
+  "export.portScan": "Port scan",
+  "export.portScanChecked": "{selection} – {probed} of {total} checked",
+  "export.portScanStopped": "(stopped)",
+  "export.portStepDone": "{selection} – {done} of {total} checks",
+  "export.portStepRefused": "{selection} – refused: more checks (devices × ports) than the limit allows",
+  "export.portStepSkipped": "{selection} – not run (the scan was stopped)",
+  "export.portStepBanners": "banners read",
+  "export.portStepNoBanners": "without banners",
+  "export.col.portScan": "Port scan",
+  "export.col.closedPorts": "Closed ports",
+  "export.col.filteredPorts": "Filtered ports",
+  "export.col.listedPorts": "Listed closed/filtered ports",
+  "export.col.banners": "Banners"
 }

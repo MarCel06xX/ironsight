@@ -265,5 +265,18 @@
   "settings.portMaxProbes": "Limit für Port-Prüfungen",
   "settings.portMaxProbesHint": "Port-Scans mit mehr Prüfungen (Geräte × Ports) werden abgelehnt (1–16.777.216).",
   "settings.banners": "Dienst-Banner und Webseitentitel lesen",
-  "settings.bannersHint": "Liest, was Dienste von sich aus senden; Webserver bekommen eine Anfrage für den Seitentitel."
+  "settings.bannersHint": "Liest, was Dienste von sich aus senden; Webserver bekommen eine Anfrage für den Seitentitel.",
+  "export.portScan": "Port-Scan",
+  "export.portScanChecked": "{selection} – {probed} von {total} geprüft",
+  "export.portScanStopped": "(gestoppt)",
+  "export.portStepDone": "{selection} – {done} von {total} Prüfungen",
+  "export.portStepRefused": "{selection} – abgelehnt: mehr Prüfungen (Geräte × Ports) als das Limit erlaubt",
+  "export.portStepSkipped": "{selection} – nicht ausgeführt (Scan wurde gestoppt)",
+  "export.portStepBanners": "Banner gelesen",
+  "export.portStepNoBanners": "ohne Banner",
+  "export.col.portScan": "Port-Scan",
+  "export.col.closedPorts": "Geschlossene Ports",
+  "export.col.filteredPorts": "Gefilterte Ports",
+  "export.col.listedPorts": "Aufgeführte geschlossene/gefilterte Ports",
+  "export.col.banners": "Banner"
 }

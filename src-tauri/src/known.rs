@@ -24,7 +24,8 @@ use crate::scan::{DataSource, HostNames, HostResult, HttpInfo, ServiceInfo};
 /// Version of the known-devices file.
 const FILE_VERSION: u32 = 1;
 /// Export schema versions the importer understands.
-const IMPORT_VERSIONS: [u32; 2] = [1, 2];
+/// JSON export schemas that can be loaded (see `export::json::SCHEMA_VERSION`).
+const IMPORT_VERSIONS: [u32; 3] = [1, 2, 3];
 const MAX_DEVICES: usize = 10_000;
 const MAX_IPS_PER_DEVICE: usize = 8;
 const MAX_SERVICES: usize = 64;
@@ -435,7 +436,8 @@ struct ImportService {
     http: Option<HttpInfo>,
 }
 
-/// One host of an export, schema 1 or 2; unknown fields are ignored.
+/// One host of an export, schema 1, 2 or 3; unknown fields (e.g. the port scan of
+/// schema 3) are ignored. Open ports of every schema are in `services`.
 #[derive(Deserialize)]
 struct ImportHost {
     ip: String,
@@ -461,7 +463,7 @@ struct ImportHost {
     last_seen: Option<String>,
 }
 
-/// Reads the devices that were online in one of our JSON exports (schema 1 or 2).
+/// Reads the devices that were online in one of our JSON exports (schema 1 to 3).
 pub fn import_export(json: &str, now_ms: u64) -> Result<Vec<KnownDevice>, ImportError> {
     let doc: Value = serde_json::from_str(json).map_err(|_| ImportError::NotAnExport)?;
     let version = doc
@@ -836,6 +838,108 @@ mod tests {
         assert_eq!(devices[0].last_seen_ms, 1_763_145_000_000);
     }
 
+    /// JSON exports written by the released versions with their own code (see the
+    /// `write_fixture` tests), one per schema.
+    const FIXTURES: [(&str, &str); 3] = [
+        (
+            "schema 1 (v0.1.3)",
+            include_str!("../tests/fixtures/export-schema1-v0.1.3.json"),
+        ),
+        (
+            "schema 2 (v0.2.0)",
+            include_str!("../tests/fixtures/export-schema2-v0.2.0.json"),
+        ),
+        (
+            "schema 3 (v0.4.0)",
+            include_str!("../tests/fixtures/export-schema3-v0.4.0.json"),
+        ),
+    ];
+    const NAS_MAC: MacAddr = MacAddr([0x00, 0x11, 0x32, 0xaa, 0xbb, 0xcc]);
+
+    #[test]
+    fn exports_of_every_schema_version_import() {
+        for (name, json) in FIXTURES {
+            let devices = import_export(json, u64::MAX).unwrap();
+            // Router and NAS answered; the unused address is no device.
+            assert_eq!(devices.len(), 2, "{name}");
+            let router = devices.iter().find(|d| d.ips == [ip(1)]).unwrap();
+            assert_eq!(
+                router.mac,
+                Some(MacAddr([0x00, 0x00, 0x0c, 0x12, 0x34, 0x56])),
+                "{name}"
+            );
+            assert_eq!(router.names.dns.as_deref(), Some("fritz.box"), "{name}");
+            let ports: Vec<u16> = router.services.iter().map(|s| s.port).collect();
+            assert!(
+                ports.contains(&80) && ports.contains(&443),
+                "{name}: {ports:?}"
+            );
+            let http = router.services.iter().find(|s| s.port == 80).unwrap();
+            assert_eq!(
+                http.http.as_ref().unwrap().server.as_deref(),
+                Some("nginx"),
+                "{name}"
+            );
+            let nas = devices.iter().find(|d| d.ips == [ip(20)]).unwrap();
+            assert_eq!(nas.mac, Some(NAS_MAC), "{name}");
+            assert_eq!(nas.names.netbios.as_deref(), Some("NAS"), "{name}");
+            assert_eq!(nas.workgroup.as_deref(), Some("WORKGROUP"), "{name}");
+            let ports: Vec<u16> = nas.services.iter().map(|s| s.port).collect();
+            assert_eq!(ports, [22, 445], "{name}");
+            assert_eq!(nas.last_seen_ms, 1_763_145_001_000, "{name}");
+        }
+        // Schema 3 also has the port-scanned SSH port of the router.
+        let devices = import_export(FIXTURES[2].1, u64::MAX).unwrap();
+        let router = devices.iter().find(|d| d.ips == [ip(1)]).unwrap();
+        assert!(router.services.iter().any(|s| s.port == 22));
+    }
+
+    #[test]
+    fn older_exports_still_work_as_comparison_data() {
+        for (name, json) in FIXTURES {
+            let mut known = KnownDevices::default();
+            known.set_imported(import_export(json, u64::MAX).unwrap());
+            let live = LiveSet::default();
+
+            // The NAS is silent now: the imported data fills its row.
+            let mut silent = HostResult::new(ip(20));
+            silent.complete = true;
+            silent.update_status();
+            let shown = apply_known(&silent, known.find(ip(20), None, &live));
+            assert_eq!(shown.status, HostStatus::Offline, "{name}");
+            assert_eq!(shown.hostname.as_deref(), Some("NAS"), "{name}");
+            assert_eq!(shown.mac, Some(NAS_MAC), "{name}");
+            assert_eq!(shown.sources.hostname, Some(DataSource::Imported), "{name}");
+            assert_eq!(shown.sources.services, Some(DataSource::Imported), "{name}");
+            assert_eq!(shown.services.len(), 2, "{name}");
+
+            // Found again under a new address via its MAC from the ARP cache.
+            assert!(known.find(ip(77), Some(NAS_MAC), &live).is_some(), "{name}");
+            // An address that answers right now is never overlaid.
+            let mut answering = LiveSet::default();
+            answering.ips.insert(ip(20));
+            assert!(known.find(ip(20), None, &answering).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn current_exports_import_too() {
+        use crate::export::tests::{fixture_hosts, sample_info, sample_options};
+        use crate::export::{Delimiter, ExportKind, write_export};
+        let mut out = Vec::new();
+        let options = sample_options(ExportKind::Json, Delimiter::Semicolon);
+        write_export(&mut out, &sample_info(), &fixture_hosts(), &options).unwrap();
+        let json = String::from_utf8(out).unwrap();
+        let devices = import_export(&json, u64::MAX).unwrap();
+        assert_eq!(devices.len(), 2);
+        // The checked-in fixture of this schema matches what the writer produces now,
+        // apart from the generator version.
+        let fixture: Value = serde_json::from_str(FIXTURES[2].1).unwrap();
+        let mut current: Value = serde_json::from_str(&json).unwrap();
+        current["generator"]["version"] = fixture["generator"]["version"].clone();
+        assert_eq!(current, fixture);
+    }
+
     #[test]
     fn import_rejects_other_files() {
         assert_eq!(import_export("", 0), Err(ImportError::NotAnExport));
@@ -845,8 +949,8 @@ mod tests {
             Err(ImportError::NotAnExport)
         );
         assert_eq!(
-            import_export(r#"{"schema_version":3,"hosts":[]}"#, 0),
-            Err(ImportError::UnsupportedVersion(3))
+            import_export(r#"{"schema_version":4,"hosts":[]}"#, 0),
+            Err(ImportError::UnsupportedVersion(4))
         );
         assert_eq!(
             import_export(
