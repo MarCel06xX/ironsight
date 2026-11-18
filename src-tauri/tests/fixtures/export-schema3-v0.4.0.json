@@ -2,7 +2,7 @@
   "schema_version": 3,
   "generator": {
     "name": "Ironsight",
-    "version": "0.2.0"
+    "version": "0.4.0"
   },
   "exported_at": "2025-11-14T18:35:00Z",
   "scope": "all",

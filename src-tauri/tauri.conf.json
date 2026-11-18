@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Ironsight",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "identifier": "io.github.marcel06xx.ironsight",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -38,7 +38,7 @@
     "homepage": "https://github.com/MarCel06xX/ironsight",
     "category": "Utility",
     "shortDescription": "Network scanner",
-    "longDescription": "Open-source desktop network scanner: host discovery, device information and export.",
+    "longDescription": "Open-source desktop network scanner: host discovery, port scanning, device information and export.",
     "windows": {
       "nsis": {
         "installMode": "currentUser",

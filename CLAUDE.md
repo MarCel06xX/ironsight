@@ -1,24 +1,28 @@
 # Ironsight – session notes
 
-Desktop network scanner (Rust + Tauri 2, vanilla TS). v1 = host discovery + device info + export,
-Windows only. Port scanning / packet capture / Linux come later – keep platform code behind
-`NetBackend`.
+Desktop network scanner (Rust + Tauri 2, vanilla TS): host discovery, TCP connect port scan,
+device info, export. Windows only. Packet capture / Linux come later – keep platform code behind
+`NetBackend` (and `platform::prepare_probe_socket`).
 
 ## Current phase
 
 **v0.2.0 released** (offline devices, known devices, three states). Released: v0.1.0-v0.1.3, v0.2.0;
 the updater was tested end to end (0.1.2 -> 0.1.3). Releases only after the user's OK.
 
-**In progress: TCP port scanner, to be released as v0.4.0** (user's version number), in 5 phases;
-commit + push after each phase, then stop and wait for the user's go.
+**v0.4.0 ready for release, not released yet** (TCP port scanner; the user chose 0.4.0, there
+is no 0.3.0). All 5 phases done; version bumped in `tauri.conf.json`, `Cargo.toml`/`Cargo.lock`,
+`package.json`/`package-lock.json`; CHANGELOG and README updated. The user runs
+`scripts/release.ps1` themselves - never run it without their explicit OK.
 - Phase 1 (backend engine) **done**: `ports/` module, see "Port scanning" below.
 - Phase 2 (banners + pipeline) **done**: port step after discovery, `scan_host_ports`,
   `ports:*` events, merged discovery check.
 - Phase 3 (UI) **done**: see "Port scan UI" below.
 - Phase 4 (export/import) **done**: JSON schema 3, CSV port columns, HTML ports section,
   fixtures of every schema in `src-tauri/tests/fixtures/`.
-- Next: phase 5 README/CHANGELOG/version bump to 0.4.0 - then regenerate the schema 3 fixture so
-  its `generator.version` says 0.4.0 (command below); do NOT run `scripts/release.ps1`.
+- Phase 5 (release prep) **done**: README (port scan features, screenshot placeholders for
+  `docs/screenshot.png` and `docs/screenshot-ports.png`, authorization notice), CHANGELOG 0.4.0,
+  version bump, schema 3 fixture regenerated with generator 0.4.0, release build checked
+  (`npm run tauri build -- --no-bundle`), live /24 + Top 100 run and stop checked.
 
 Ideas: screenshots in `docs/`, code signing, HTTPS titles (needs a TLS crate - ask), packet
 capture, Linux backend.

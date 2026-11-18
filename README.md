@@ -5,20 +5,22 @@
 <h1 align="center">Ironsight</h1>
 
 <p align="center">
-  Open-source desktop network scanner for Windows – host discovery, device information and export.<br>
+  Open-source desktop network scanner for Windows – host discovery, port scanning, device information and export.<br>
   Built with Rust and Tauri 2. <a href="#deutsch">Deutsche Version weiter unten.</a>
 </p>
 
 > [!IMPORTANT]
 > **Only scan networks you own or are explicitly authorized to scan.** Scanning other people's
-> networks can be illegal in your country and may violate terms of service. You are responsible
-> for how you use this tool.
+> networks can be illegal in your country and may violate terms of service. Port scans in
+> particular are often treated as an attack. You are responsible for how you use this tool;
+> Ironsight shows this notice once more before your first port scan.
 
 ## Screenshots
 
 _Screenshots will follow._
 
 <!-- ![Ironsight main window](docs/screenshot.png) -->
+<!-- ![Port scan results in the details panel](docs/screenshot-ports.png) -->
 
 ## Features
 
@@ -29,8 +31,20 @@ _Screenshots will follow._
   up to 65,536 addresses per scan. Picking a network adapter fills in its subnet.
 - **Device information:** hostname from reverse DNS, mDNS and NetBIOS (the source is shown), MAC
   address and vendor (embedded IEEE OUI table, randomized/private MACs are labeled), response
-  time, NetBIOS workgroup, open services from a small port list (FTP, SSH, Telnet, HTTP, HTTPS,
-  SMB, RDP, 8080, 8443), and HTTP `Server` header and page title.
+  time, NetBIOS workgroup, open services from a quick check of 9 common ports (FTP, SSH,
+  Telnet, HTTP, HTTPS, SMB, RDP, 8080, 8443), and HTTP `Server` header and page title.
+- **Port scanning (TCP connect):** optional after host discovery for every device that answered,
+  or for a single device ("Scan ports …" in the context menu). Choose *Common* (22 ports),
+  *Top 100*, *Top 1000*, *All* (1–65,535) or your own list like `22,80,443,8000-8100`. Every port
+  is *open*, *closed* (connection refused) or *filtered* (no answer). Plain sockets only: no
+  administrator rights, no raw sockets, no Npcap. Limits for parallel checks (overall and per
+  device) and a cap on the number of checks (devices × ports, 1,000,000 by default) – larger
+  scans are refused, never silently cut short. Stop works at any time.
+- **Service banners:** optionally reads what services send by themselves (SSH, FTP, SMTP, POP3,
+  IMAP, VNC, …) and the title of web pages. Nothing is sent to other ports. Banners are treated
+  as untrusted: control and invisible characters are removed and the length is limited.
+- **Port results everywhere:** an "Open ports" column (sortable, filter with `port:22`), a port
+  table with service, state and banner in the details panel, and port results in all exports.
 - **Offline devices:** addresses that do not answer still show what is known – reverse DNS names
   (the router often knows them from DHCP), MAC and vendor from the Windows ARP cache, and devices
   seen earlier: in this session, saved between sessions (opt-in) or loaded from a previous JSON
@@ -43,8 +57,9 @@ _Screenshots will follow._
 - **Actions per host:** copy IP or MAC, open in the browser (HTTP/HTTPS), connect with Remote
   Desktop, show file shares in Explorer, Wake-on-LAN.
 - **Export:** CSV (Excel-friendly, `;` or `,` as delimiter), JSON (all data, versioned schema)
-  and a printable, self-contained HTML report – for all scanned addresses or just the filtered
-  view.
+  and a printable, self-contained HTML report with a ports section per device – for all scanned
+  addresses or just the filtered view. Exports of every earlier version can still be loaded as a
+  previous scan.
 - **Themes and languages:** five color themes (dark, light, deep blue, terminal green, purple),
   English and German, switchable without a restart.
 - **Updates:** the installed version looks for a new release on startup and, after you confirm,
@@ -88,7 +103,8 @@ matter). Then choose **More info → Run anyway**.
 | Discovery | `SendARP`, `IcmpSendEcho`, TCP connect | ARP only works inside the local network segment, so MAC address and vendor stay empty for hosts behind a router. That is expected. |
 | Names | Reverse DNS (PTR), mDNS, NetBIOS node status | Hand-written packet builders and parsers; all received data is bounds-checked and treated as untrusted. |
 | Vendor | IEEE MA-L registry | Converted into a compact table and embedded in the program – no downloads at runtime. |
-| Services | TCP connect, HTTP/1.0 `GET /` | Page titles are read on ports 80 and 8080. Redirects are only followed on the same host and port. |
+| Services | TCP connect on 9 common ports, HTTP/1.0 `GET /` | Part of host discovery. Page titles are read on HTTP ports; redirects are only followed on the same host and port. |
+| Port scan | TCP connect, passive banner read | Answers from host discovery are reused, so no port is checked twice. On Windows a refused connection is normally retried for about 2 seconds; Ironsight switches these retries off per socket (`SIO_TCP_INITIAL_RTO`), so closed ports are reported at once and the timeout applies exactly. Connections to open ports are reset when closed, which leaves no `TIME_WAIT` entries behind on large scans. |
 | Silent addresses | Reverse DNS for every address (automatic up to 1,024 addresses, configurable), `GetIpNetTable2` neighbor cache, known devices | Matched by MAC, or by IP when no MAC is known. If an address answers with a different MAC, the live device wins. |
 
 ## Build from source
@@ -131,6 +147,7 @@ src/                  Frontend (TypeScript, no framework): table, dialogs, i18n,
 src/locales/          English and German texts (also used for exports)
 src-tauri/src/
   scan/               Target parsing and the scan engine
+  ports/              Port scan: port lists and presets, probe, banners, scan engine
   platform/           OS-specific code behind a trait (Windows: IP Helper API)
   enrich/             DNS, mDNS, NetBIOS, vendor lookup, service probes
   export/             CSV, JSON and HTML writers
@@ -140,7 +157,7 @@ tools/oui/            Converter for the IEEE vendor list
 
 ## Roadmap
 
-Ideas for later versions: port scanning, packet capture and Linux support.
+Ideas for later versions: HTTPS page titles, packet capture and Linux support.
 
 ## License
 
@@ -162,7 +179,9 @@ Informationen zu ihnen an und exportiert die Ergebnisse.
 > [!IMPORTANT]
 > **Scanne nur Netzwerke, die dir gehören oder für die du ausdrücklich eine Erlaubnis hast.**
 > Das Scannen fremder Netzwerke kann strafbar sein (in Deutschland u. a. nach § 202c StGB) und
-> gegen Nutzungsbedingungen verstoßen. Für den Einsatz bist du selbst verantwortlich.
+> gegen Nutzungsbedingungen verstoßen. Gerade Port-Scans werden oft als Angriff gewertet. Für den
+> Einsatz bist du selbst verantwortlich; Ironsight zeigt diesen Hinweis vor dem ersten Port-Scan
+> noch einmal an.
 
 ### Funktionen
 
@@ -171,7 +190,20 @@ Informationen zu ihnen an und exportiert die Ergebnisse.
 - **Ziele:** einzelne Adressen, Bereiche wie `192.168.1.10-50`, CIDR von `/16` bis `/32` und
   Listen mit Kommas; bis zu 65.536 Adressen pro Scan.
 - **Geräteinfos:** Hostname aus DNS, mDNS und NetBIOS (mit Quelle), MAC-Adresse und Hersteller,
-  Antwortzeit, Arbeitsgruppe, offene Dienste sowie Webserver und Seitentitel.
+  Antwortzeit, Arbeitsgruppe, offene Dienste aus einer Schnellprüfung von 9 häufigen Ports sowie
+  Webserver und Seitentitel.
+- **Port-Scan (TCP-Connect):** optional nach der Gerätesuche für alle Geräte, die antworten, oder
+  für ein einzelnes Gerät („Ports scannen …“ im Kontextmenü). Auswahl *Häufige* (22 Ports),
+  *Top 100*, *Top 1000*, *Alle* (1–65.535) oder eine eigene Liste wie `22,80,443,8000-8100`. Jeder
+  Port ist *offen*, *geschlossen* (Verbindung abgelehnt) oder *gefiltert* (keine Antwort). Nur
+  normale Sockets: keine Administratorrechte, keine Raw Sockets, kein Npcap. Limits für parallele
+  Prüfungen (gesamt und pro Gerät) und eine Obergrenze für die Zahl der Prüfungen (Geräte × Ports,
+  standardmäßig 1.000.000) – größere Scans werden abgelehnt, nie stillschweigend gekürzt.
+- **Dienst-Banner:** liest optional, was Dienste von sich aus senden (SSH, FTP, SMTP, POP3, IMAP,
+  VNC, …), und den Titel von Webseiten. An andere Ports wird nichts gesendet. Banner gelten als
+  nicht vertrauenswürdig: Steuer- und unsichtbare Zeichen werden entfernt, die Länge begrenzt.
+- **Port-Ergebnisse überall:** Spalte „Offene Ports“ (sortierbar, Filter mit `port:22`),
+  Port-Tabelle mit Dienst, Zustand und Banner in der Detailansicht und in allen Exporten.
 - **Offline-Geräte:** Auch Adressen ohne Antwort zeigen, was bekannt ist: Namen per Reverse-DNS,
   MAC und Hersteller aus dem ARP-Cache sowie früher gesehene Geräte (aus dieser Sitzung, optional
   gespeichert oder aus einem früheren JSON-Export über „Vorherigen Scan laden …“). Zu jedem Wert
@@ -181,7 +213,9 @@ Informationen zu ihnen an und exportiert die Ergebnisse.
   online / offline / unbelegt, Spalte „Zuletzt gesehen“ und Detailansicht.
 - **Aktionen:** IP/MAC kopieren, im Browser öffnen, Remotedesktop, Freigaben im Explorer,
   Wake-on-LAN.
-- **Export** als CSV (für deutsches Excel mit `;`), JSON oder druckbarer HTML-Bericht.
+- **Export** als CSV (für deutsches Excel mit `;`), JSON oder druckbarer HTML-Bericht mit
+  Port-Abschnitt pro Gerät. Exporte aller früheren Versionen lassen sich weiterhin als vorheriger
+  Scan laden.
 - **Fünf Farbdesigns**, Deutsch und Englisch, Umschalten ohne Neustart.
 - **Updates:** Die installierte Version sucht beim Start nach einer neuen Version und installiert
   sie nach Bestätigung (signierte Update-Pakete). Die portable Version öffnet die Download-Seite.
