@@ -6,21 +6,18 @@ device info, export. Windows only. Packet capture / Linux come later – keep pl
 
 ## Current phase
 
-**v0.2.0 released** (offline devices, known devices, three states). Released: v0.1.0-v0.1.3, v0.2.0;
-the updater was tested end to end (0.1.2 -> 0.1.3). Releases only after the user's OK.
-
-**v0.4.0 ready for release, not released yet** (TCP port scanner; the user chose 0.4.0, there
-is no 0.3.0). All 5 phases done; version bumped in `tauri.conf.json`, `Cargo.toml`/`Cargo.lock`,
-`package.json`/`package-lock.json`; CHANGELOG and README updated. The user runs
-`scripts/release.ps1` themselves - never run it without their explicit OK.
+**v0.4.0 released** (2026-11-18, TCP port scanner; the user chose 0.4.0, there is no 0.3.0).
+Released: v0.1.0-v0.1.3, v0.2.0, v0.4.0; the updater was tested end to end (0.1.2 -> 0.1.3).
+Releases only after the user's OK (`scripts/release.ps1`). Port scanner history, 5 phases:
 - Phase 1 (backend engine) **done**: `ports/` module, see "Port scanning" below.
 - Phase 2 (banners + pipeline) **done**: port step after discovery, `scan_host_ports`,
   `ports:*` events, merged discovery check.
 - Phase 3 (UI) **done**: see "Port scan UI" below.
 - Phase 4 (export/import) **done**: JSON schema 3, CSV port columns, HTML ports section,
   fixtures of every schema in `src-tauri/tests/fixtures/`.
-- Phase 5 (release prep) **done**: README (port scan features, screenshot placeholders for
-  `docs/screenshot.png` and `docs/screenshot-ports.png`, authorization notice), CHANGELOG 0.4.0,
+- Phase 5 (release prep) **done**, then released with `scripts/release.ps1`: README (port scan
+  features, screenshot placeholders for `docs/screenshot.png` and `docs/screenshot-ports.png`,
+  authorization notice), CHANGELOG 0.4.0,
   version bump, schema 3 fixture regenerated with generator 0.4.0, release build checked
   (`npm run tauri build -- --no-bundle`), live /24 + Top 100 run and stop checked.
 
